@@ -2,28 +2,43 @@ use crate::bool_ops::BoolOpsNum;
 use crate::convex_hull::qhull;
 use crate::utils::partial_min;
 use crate::{
-    Buffer, Contains, Coord, CoordNum, Distance, Euclidean, GeoFloat, Length, Line, LinesIter, LineString,
+    Buffer, Coord, CoordNum, Distance, Euclidean, GeoFloat, Geometry, GeometryCollection, Length, Line, LinesIter, LineString,
     Intersects, MultiLineString, MultiPoint, MultiPolygon, Polygon, coord, point,
 };
 use rstar::{Envelope, ParentNode, RTree, RTreeNode, RTreeNum, AABB};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    convert::TryInto,
+};
 
 pub trait ConcaveHull {
     type Scalar: CoordNum;
     fn concave_hull(&self, concavity: Option<Self::Scalar>, length_threshold: Option<Self::Scalar>) -> Polygon<Self::Scalar>;
 }
 
-impl<T> ConcaveHull for Polygon<T>
+impl<T> ConcaveHull for MultiPoint<T>
 where
     T: GeoFloat + RTreeNum,
 {
     type Scalar = T;
+    fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<T> {
+        let mut coords: Vec<Coord<T>> = self.iter().map(|point| point.0).collect();
+        concave_hull(&mut coords, concavity, length_threshold, None, None)
+    }
+}
+
+impl<T> ConcaveHull for Polygon<T>
+where
+    T: GeoFloat + RTreeNum + BoolOpsNum + 'static,
+{
+    type Scalar = T;
     fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<Self::Scalar> {
-        let mut points: Vec<Coord<T>> = self.exterior().0.clone();
-        let polygons = vec![self.clone()];
-        // TODO: Just get the exterior line of the polygon (as could be an issue with intersects)
-        concave_hull(&mut points, concavity, length_threshold, Some(polygons), None, None)
+        let mut coords: Vec<Coord<T>> = Vec::new();
+        let mut non_diggable_lines: Vec<Line<T>> = Vec::new();
+        let mut buffered_polygons: Vec<Polygon<T>> = Vec::new();
+        add_polygon(self, &mut coords, &mut non_diggable_lines, &mut buffered_polygons);
+        concave_hull(&mut coords, concavity, length_threshold, Some(non_diggable_lines), Some(buffered_polygons))
     }
 }
 
@@ -33,16 +48,13 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<Self::Scalar> {
-        let mut aggregated: Vec<Coord<T>> = self
-            .0
-            .iter()
-            .flat_map(|elem| elem.exterior().0.clone())
-            .collect();
-        let polygons: Vec<Polygon<T>> = self.0.clone();
-        let buffered_polygons: Vec<Polygon<T>> = polygons.iter().flat_map(|poly| {
-            poly.buffer(T::from(-1e-10).unwrap()).0
-        }).collect();
-        concave_hull(&mut aggregated, concavity, length_threshold, Some(polygons), None, Some(buffered_polygons))
+        let mut coords: Vec<Coord<T>> = Vec::new();
+        let mut non_diggable_lines: Vec<Line<T>> = Vec::new();
+        let mut buffered_polygons: Vec<Polygon<T>> = Vec::new();
+        for polygon in self.0.iter() {
+            add_polygon(polygon, &mut coords, &mut non_diggable_lines, &mut buffered_polygons);
+        }
+        concave_hull(&mut coords, concavity, length_threshold, Some(non_diggable_lines), Some(buffered_polygons))
     }
 }
 
@@ -52,8 +64,8 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<Self::Scalar> {
-        let lines: Vec<Line<T>> = self.lines().collect();
-        concave_hull(&mut self.0.clone(), concavity, length_threshold, None, Some(lines), None)
+        let non_diggable_lines: Vec<Line<T>> = self.lines().collect();
+        concave_hull(&mut self.0.clone(), concavity, length_threshold, Some(non_diggable_lines), None)
     }
 }
 
@@ -63,45 +75,93 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<T> {
-        let mut aggregated: Vec<Coord<T>> = self.iter().flat_map(|elem| elem.0.clone()).collect();
-        let lines: Vec<Line<T>> = self.iter().flat_map(|elem| elem.lines()).collect();
-        concave_hull(&mut aggregated, concavity, length_threshold, None, Some(lines), None)
+        let mut coords: Vec<Coord<T>> = self.iter().flat_map(|elem| elem.0.clone()).collect();
+        let non_diggable_lines: Vec<Line<T>> = self.iter().flat_map(|elem| elem.lines()).collect();
+        concave_hull(&mut coords, concavity, length_threshold, Some(non_diggable_lines), None)
     }
 }
 
-impl<T> ConcaveHull for MultiPoint<T>
+impl<T> ConcaveHull for GeometryCollection<T>
 where
-    T: GeoFloat + RTreeNum,
+    T: GeoFloat + RTreeNum + BoolOpsNum + 'static,
 {
     type Scalar = T;
-    fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<T> {
-        let mut coordinates: Vec<Coord<T>> = self.iter().map(|point| point.0).collect();
-        concave_hull(&mut coordinates, concavity, length_threshold, None, None, None)
+    fn concave_hull(&self, concavity: Option<T>, length_threshold: Option<T>) -> Polygon<Self::Scalar> {
+        let mut coords: Vec<Coord<T>> = Vec::new();
+        let mut non_diggable_lines: Vec<Line<T>> = Vec::new();
+        let mut buffered_polygons: Vec<Polygon<T>> = Vec::new();
+        add_geometry_collection(self, &mut coords, &mut non_diggable_lines, &mut buffered_polygons);
+        concave_hull(&mut coords, concavity, length_threshold, Some(non_diggable_lines), Some(buffered_polygons))
     }
 }
 
-fn non_diggable_lines<T>(
-    polygons: &Option<Vec<Polygon<T>>>,
-    lines: &Option<Vec<Line<T>>>,
-) -> Option<RTree<Line<T>>> 
-where 
-    T: GeoFloat + RTreeNum,
+fn add_geometry_collection<T>(
+    collection: &GeometryCollection<T>,
+    coords: &mut Vec<Coord<T>>,
+    non_diggable_lines: &mut Vec<Line<T>>,
+    buffered_polygons: &mut Vec<Polygon<T>>,
+)
+where
+    T: GeoFloat + RTreeNum + BoolOpsNum + 'static,
 {
-    let mut all_lines = Vec::new();
-    
-    if let Some(polygons) = polygons {
-        all_lines.extend(polygons.iter().flat_map(|polygon| polygon.exterior().lines_iter()));
+    for geometry in collection.0.iter() {
+        match geometry {
+            Geometry::Point(point) => {
+                coords.push(point.0);
+            }
+            Geometry::MultiPoint(multi_point) => {
+                coords.extend(multi_point.iter().map(|p| p.0));
+            }
+            Geometry::Line(line) => {
+                coords.push(line.start);
+                coords.push(line.end);
+                non_diggable_lines.push(*line);
+            }
+            Geometry::LineString(line_string) => {
+                coords.extend(line_string.0.iter());
+                non_diggable_lines.extend(line_string.lines());
+            }
+            Geometry::MultiLineString(multi_line_string) => {
+                for line_string in multi_line_string.iter() {
+                    coords.extend(line_string.0.iter());
+                    non_diggable_lines.extend(line_string.lines());
+                }
+            }
+            Geometry::Polygon(polygon) => {
+                add_polygon(polygon, coords, non_diggable_lines, buffered_polygons);
+            }
+            Geometry::MultiPolygon(multi_polygon) => {
+                for polygon in multi_polygon.iter() {
+                    add_polygon(polygon, coords, non_diggable_lines, buffered_polygons);
+                }
+            }
+            Geometry::Triangle(triangle) => {
+                let polygon: Polygon<T> = triangle.clone().try_into().unwrap();
+                add_polygon(&polygon, coords, non_diggable_lines, buffered_polygons);
+            }
+            Geometry::Rect(rect) => {
+                let polygon: Polygon<T> = rect.clone().try_into().unwrap();
+                add_polygon(&polygon, coords, non_diggable_lines, buffered_polygons);
+            }
+            Geometry::GeometryCollection(nested_collection) => {
+                add_geometry_collection(nested_collection, coords, non_diggable_lines, buffered_polygons);
+            }
+        }
     }
+}
 
-    if let Some(lines) = lines {
-        all_lines.extend(lines.iter().copied());
-    }
-    
-    if all_lines.is_empty() {
-        None
-    } else {
-        Some(RTree::bulk_load(all_lines))
-    }
+fn add_polygon<T>(
+    polygon: &Polygon<T>,
+    coords: &mut Vec<Coord<T>>,
+    non_diggable_lines: &mut Vec<Line<T>>,
+    buffered_polygons: &mut Vec<Polygon<T>>,
+) 
+where 
+    T: GeoFloat + RTreeNum + BoolOpsNum + 'static,
+{
+    coords.extend(polygon.exterior().0.iter());
+    non_diggable_lines.extend(polygon.exterior().lines_iter());
+    buffered_polygons.extend(polygon.buffer(T::from(-1e-10).unwrap()).0);
 }
 
 fn line_diggable<T>(
@@ -337,9 +397,12 @@ where
                     if nearest_diggable_line == line || nearest_diggable_line == &Line::new(line.end, line.start) {
                         let start_line = Line::new(line.start, *leaf);
                         let end_line = Line::new(*leaf, line.end);
-                        if no_hull_intersections(&start_line, current_hull_tree) && no_hull_intersections(&end_line, current_hull_tree) &&
-                           !inner_line_intersections(&start_line, non_diggable_lines_tree) && !inner_line_intersections(&end_line, non_diggable_lines_tree) &&
-                           no_inner_polygon_intersections(&start_line, inner_polygon_tree) && no_inner_polygon_intersections(&end_line, inner_polygon_tree)
+                        if no_hull_intersections(&start_line, current_hull_tree) && 
+                            no_hull_intersections(&end_line, current_hull_tree) &&
+                            !inner_line_intersections(&start_line, non_diggable_lines_tree) && 
+                            !inner_line_intersections(&end_line, non_diggable_lines_tree) &&
+                            no_inner_polygon_intersections(&start_line, inner_polygon_tree) && 
+                            no_inner_polygon_intersections(&end_line, inner_polygon_tree)
                         {
                             return Some(*leaf);
                         }
@@ -380,8 +443,7 @@ fn concave_hull<T>(
     coords: &mut [Coord<T>],
     concavity: Option<T>, 
     length_threshold: Option<T>, 
-    polygons: Option<Vec<Polygon<T>>>, 
-    inner_lines: Option<Vec<Line<T>>>,
+    non_diggable_lines: Option<Vec<Line<T>>>,
     buffered_polygons: Option<Vec<Polygon<T>>>,
 ) -> Polygon<T>
 where
@@ -395,11 +457,10 @@ where
     // Index the points with an R-tree
     let mut interior_points_tree: RTree<Coord<T>> = RTree::bulk_load(coords.to_owned());
     let mut current_hull_tree: RTree<Line<T>> = RTree::bulk_load(hull.lines().collect());
-    let non_diggable_lines_tree: Option<RTree<Line<T>>> = non_diggable_lines(&polygons, &inner_lines);
+    let non_diggable_lines_tree: Option<RTree<Line<T>>> = non_diggable_lines.map(RTree::bulk_load);
     let mut diggable_lines_tree: RTree<Line<T>> = RTree::new();
-    // let mut unordered_concave_lines: Vec<Line<T>> = vec![];
-    let mut concave_lines: HashMap<usize, (Line<T>, usize)> = HashMap::new();
 
+    let mut concave_lines: HashMap<usize, (Line<T>, usize)> = HashMap::new();
     let mut line_queue: VecDeque<LineQueueItem<T>> = VecDeque::new();
     for (i, line) in hull.lines().enumerate() {
         // line_queue.push_back(line);
@@ -411,7 +472,6 @@ where
             concave_lines.insert(i, (line, i+1));
         }
         // Remove hull points from interior points
-        // TODO: Fix this hacky way of ensuring we only remove each hull point once
         if i == 0 {
             interior_points_tree.remove(&line.start);
         }
@@ -419,22 +479,6 @@ where
     }
 
     let buffered_polygon_tree: Option<RTree<Polygon<T>>> = buffered_polygons.map(RTree::bulk_load);
-
-    // TODO: Remove interior points that are within inner polygons
-    let inner_polygon_tree: Option<RTree<Polygon<T>>> = polygons.map(RTree::bulk_load);
-    if let Some(ref tree) = inner_polygon_tree {
-        for coord in coords.iter() {
-            let p = point!([coord.x, coord.y]);
-            let bbox = AABB::from_point(p);
-            let polygons = tree.locate_in_envelope_intersecting(&bbox);
-            for polygon in polygons {
-                if polygon.contains(&p) {
-                    interior_points_tree.remove(coord);
-                    break;
-                }
-            }
-        }
-    }
 
     let mut current_i = hull.0.len() + 1;
     while let Some(line_queue_item) = line_queue.pop_front() {
