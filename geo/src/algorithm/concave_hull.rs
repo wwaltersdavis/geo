@@ -3,10 +3,10 @@ use crate::convex_hull::qhull;
 use crate::utils::partial_min;
 use crate::{
     BoundingRect, Buffer, Coord, CoordNum, Distance, Euclidean, GeoFloat, Geometry, GeometryCollection, 
-    Intersects, Length, Line, LineString, LinesIter, MultiLineString, MultiPoint, MultiPolygon, Polygon,
+    Intersects, Length, Line, LinesIter, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon,
     coord, point,
 };
-use rstar::{Envelope, ParentNode, RTree, RTreeNode, RTreeNum, AABB};
+use rstar::{AABB, Envelope, ParentNode, RTree, RTreeNode, RTreeNum};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, VecDeque},
@@ -17,7 +17,7 @@ use std::{
 /// constructing edges such that the exterior of the polygon incorporates points that would
 /// be interior points in a convex hull.
 ///
-/// This implementation is based on <https://github.com/mapbox/concaveman>
+/// This implementation is heavily based on <https://github.com/mapbox/concaveman>
 /// but also ensures interior geometries are not intersected by the hull.
 ///
 /// # Examples
@@ -52,11 +52,11 @@ pub trait ConcaveHull {
     /// Create a new polygon as the concave hull of the geometry.
     /// 
     /// # Arguments
-    /// * `concavity` - A relative measure of how concave the hull should be. Higher values result in a more
-    ///   concave hull. Defaults to 2.0 if None.
+    /// * `concavity` (optional) - A relative measure of how concave the hull should be. Higher values result in a more
+    ///   concave hull. Inifinity results in a convex hull. Default: 2.0.
     /// 
-    /// * `length_threshold` - The minimum length of hull edges. Edges shorter than this will not be further
-    ///   will not be considered for digging. Defaults to 0.0 if None.
+    /// * `length_threshold` (optional) - The minimum length of hull edges. If specified edges shorter than this will not 
+    ///   be further considered for digging. Default: 0.0.
     /// 
     /// # Returns
     /// * A `Polygon` representing the concave hull of the geometry.
@@ -227,8 +227,10 @@ where
 {
     coords.extend(polygon.exterior().0.iter());
     lines.extend(polygon.exterior().lines_iter());
+
+    // Buffer the interior polygons by a small fraction of the polygon size
     let bounding_rect = polygon.bounding_rect().unwrap();
-    let buffer_distance = (bounding_rect.width() + bounding_rect.height()) * T::from(-1e-8).unwrap();
+    let buffer_distance = partial_min(bounding_rect.width(), bounding_rect.height()) * T::from(-1e-6).unwrap();
     buffered_polygons.extend(polygon.buffer(buffer_distance).0);
 }
 
@@ -301,19 +303,19 @@ where
     let c4 = coord!{x: aabb.upper().x, y: aabb.lower().y};
     let d1 = Euclidean.distance(line, &Line::new(c1, c4));
     if d1 == T::zero() {
-        return T::zero();
+        return d1;
     }
     let d2 = Euclidean.distance(line, &Line::new(c1, c2));
     if d2 == T::zero() {
-        return T::zero();
+        return d2;
     }
     let d3 = Euclidean.distance(line, &Line::new(c4, c3));
     if d3 == T::zero() {
-        return T::zero();
+        return d3;
     }
     let d4 = Euclidean.distance(line, &Line::new(c2, c3));
     if d4 == T::zero() {
-        return T::zero();
+        return d4;
     }
     partial_min(partial_min(d1, d2), partial_min(d3, d4))
 }
@@ -340,19 +342,19 @@ where
     true
 }
 
-// This is a rather hacky method of determining if a line is touching a geometry vs
-// if it is intersecting it.
-// TODO: Find a better way of doing this
 fn shifted_intersects<T, G>(line: &Line<T>, inner_geometry: &G) -> bool 
 where
     T: GeoFloat,
     G: Intersects<Line<T>>,
 {
-    let shift = Euclidean.length(line) * T::from(1e-10).unwrap();
+    // This is a rather hacky method of determining if a line is touching a geometry vs
+    // if it is intersecting it.
+    // TODO: Find a better way of doing this
+    let shift = Euclidean.length(line) * T::from(1e-6).unwrap();
 
     inner_geometry.intersects(&Line::new(
-        point!(x: line.start.x + shift, y: line.start.y + shift),
-        point!(x: line.end.x + shift, y: line.end.y + shift),
+        point!(x: line.start.x + shift, y: line.start.y),
+        point!(x: line.end.x + shift, y: line.end.y),
     )) && 
     inner_geometry.intersects(&Line::new(
         point!(x: line.start.x - shift, y: line.start.y),
@@ -409,10 +411,10 @@ where
 }
 
 fn find_candidate<T>(
-    interior_points_tree: &RTree<Coord<T>>,
     line: &Line<T>,
-    current_hull_tree: &RTree<Line<T>>,
     max_length: &T,
+    interior_points_tree: &RTree<Coord<T>>,
+    current_hull_tree: &RTree<Line<T>>,
     diggable_lines_tree: &RTree<Line<T>>,
     non_diggable_lines_tree: &Option<RTree<Line<T>>>,
     buffered_polygon_tree: &Option<RTree<Polygon<T>>>,
@@ -420,12 +422,14 @@ fn find_candidate<T>(
 where
     T: GeoFloat + RTreeNum,
 {
+    // Initialize priority queue with R-tree root node
     let mut queue: BinaryHeap<QueueItem<T>> = BinaryHeap::new();
     queue.push(QueueItem {
         tree_node: RTreeNodePointer::Parent(interior_points_tree.root()),
         distance: T::zero(),
     });
 
+    // Perform depth first search through R-tree
     while let Some(node) = queue.pop() {
         match node.tree_node {
             RTreeNodePointer::Parent(parent) => {
@@ -454,17 +458,21 @@ where
                 }
             }
             RTreeNodePointer::Leaf(leaf) => {
-                // Ensure the potential candidate's point's nearest diggable line is the line in question
+                // Skip all points that are closer to another diggable line
+                // Note: This is the key divergence from MapBox's concaveman algorithm which 
+                // only checks this for the hull lines before and after the current line
                 if let Some(nearest_diggable_line) = diggable_lines_tree.nearest_neighbor(&point![x: leaf.x, y: leaf.y]) {
                     if nearest_diggable_line == line || nearest_diggable_line == &Line::new(line.end, line.start) {
                         let start_line = Line::new(line.start, *leaf);
                         let end_line = Line::new(*leaf, line.end);
-                        if no_hull_intersections(&start_line, current_hull_tree) && 
-                            no_hull_intersections(&end_line, current_hull_tree) &&
-                            !inner_line_intersections(&start_line, non_diggable_lines_tree) && 
-                            !inner_line_intersections(&end_line, non_diggable_lines_tree) &&
-                            no_inner_polygon_intersections(&start_line, buffered_polygon_tree) && 
-                            no_inner_polygon_intersections(&end_line, buffered_polygon_tree)
+
+                        // Skip candidate if it would cause intersections with hull lines or interior geometries
+                        if no_hull_intersections(&start_line, current_hull_tree) 
+                            && no_hull_intersections(&end_line, current_hull_tree)
+                            && !inner_line_intersections(&start_line, non_diggable_lines_tree) 
+                            && !inner_line_intersections(&end_line, non_diggable_lines_tree)
+                            && no_inner_polygon_intersections(&start_line, buffered_polygon_tree) 
+                            && no_inner_polygon_intersections(&end_line, buffered_polygon_tree)
                         {
                             return Some(*leaf);
                         }
@@ -512,10 +520,21 @@ where
     T: GeoFloat + RTreeNum,
 {
     // Ensure concavity is non-negative, default to 2.0
-    let concavity: T = match concavity {Some(c) => T::max(T::zero(), c), None => T::from(2.0).unwrap()};
+    let concavity: T = match concavity {
+        Some(c) => T::max(T::zero(), c),
+        None => T::from(2.0).unwrap(),
+    };
     let length_threshold: T = length_threshold.unwrap_or(T::from(0.0).unwrap());
-    let hull = qhull::quick_hull(coords);
 
+    // Compute initial convex hull
+    let hull = qhull::quick_hull(coords);
+    
+    // Returns convex hull if less than 4 points
+    if coords.len() < 4 {
+        return Polygon::new(hull, vec![]);
+    }
+
+    // Build R-trees for interior points, hull lines and interior geometries
     let mut interior_points_tree: RTree<Coord<T>> = RTree::bulk_load(coords.to_owned());
     let mut current_hull_tree: RTree<Line<T>> = RTree::bulk_load(hull.lines().collect());
     let mut diggable_lines_tree: RTree<Line<T>> = RTree::new();
@@ -524,14 +543,20 @@ where
 
     let mut concave_lines: HashMap<usize, (Line<T>, usize)> = HashMap::new();
     let mut line_queue: VecDeque<LineQueueItem<T>> = VecDeque::new();
+
+    // Populate line queue with initial diggable hull lines
     for (i, line) in hull.lines().enumerate() {
-        // Only populate queue with diggable lines
         if line_diggable(&line, &non_diggable_lines_tree) {
             diggable_lines_tree.insert(line);
-            line_queue.push_back(LineQueueItem {line, i, next_i: i + 1});
+            line_queue.push_back(LineQueueItem {
+                line,
+                i,
+                next_i: i + 1,
+            });
         } else {
-            concave_lines.insert(i, (line, i+1));
+            concave_lines.insert(i, (line, i + 1));
         }
+
         // Remove hull points from interior points
         if i == 0 {
             interior_points_tree.remove(&line.start);
@@ -539,60 +564,171 @@ where
         interior_points_tree.remove(&line.end);
     }
 
+    // Set current hull line index for new lines
     let mut current_i = hull.0.len() + 1;
+
     while let Some(line_queue_item) = line_queue.pop_front() {
         let line = line_queue_item.line;
         let length = Euclidean.length(&line);
+        
         if length >= length_threshold {
             let max_length = length / concavity;
+            
             if let Some(candidate_point) = find_candidate(
-                &interior_points_tree,
                 &line,
-                &current_hull_tree,
                 &max_length,
+                &interior_points_tree,
+                &current_hull_tree,
                 &diggable_lines_tree,
                 &non_diggable_lines_tree,
-                &buffered_polygon_tree) {
-                    let start_line = Line::new(line.start, candidate_point);
-                    let end_line = Line::new(candidate_point, line.end);
-                    if partial_min(Euclidean.length(&start_line), Euclidean.length(&end_line)) < max_length {
-                        // TODO: Handle removing potential duplicate points better
-                        // Currently decreases performance by ~5%
-                        let n = interior_points_tree.nearest_neighbors(&candidate_point).len();
-                        for _ in 0..n {
-                            interior_points_tree.remove(&candidate_point);
-                        };
-                        interior_points_tree.remove(&candidate_point);               
-                        current_hull_tree.remove(&line);
-                        current_hull_tree.insert(start_line);
-                        current_hull_tree.insert(end_line);
-                        diggable_lines_tree.remove(&line);
-                        if line_diggable(&start_line, &non_diggable_lines_tree) {
-                            diggable_lines_tree.insert(start_line);
-                            line_queue.push_back(LineQueueItem {
-                                line: start_line,
-                                i: line_queue_item.i,
-                                next_i: current_i,
-                            });
-                        } else {
-                            concave_lines.insert(line_queue_item.i, (start_line, current_i));
-                        }
-                        if line_diggable(&end_line, &non_diggable_lines_tree) {
-                            diggable_lines_tree.insert(end_line);
-                            line_queue.push_back(LineQueueItem {
-                                line: end_line,
-                                i: current_i,
-                                next_i: line_queue_item.next_i,
-                            });
-                        } else {
-                            concave_lines.insert(current_i, (end_line, line_queue_item.next_i));
-                        }
-                        current_i += 1;
-                        continue;
+                &buffered_polygon_tree,
+            ) {
+                let start_line = Line::new(line.start, candidate_point);
+                let end_line = Line::new(candidate_point, line.end);
+                
+                if partial_min(Euclidean.length(&start_line), Euclidean.length(&end_line)) < max_length {
+                    // TODO: Handle removing potential duplicate points better
+                    // Currently decreases performance by ~5%
+                    // Remove candidate point from interior points
+                    let n = interior_points_tree.nearest_neighbors(&candidate_point).len();
+                    for _ in 0..n {
+                        interior_points_tree.remove(&candidate_point);
                     }
+                    
+                    // Remove old hull line from trees
+                    diggable_lines_tree.remove(&line);
+                    current_hull_tree.remove(&line);
+
+                    // Insert new hull lines into current hull tree
+                    current_hull_tree.insert(start_line);
+                    current_hull_tree.insert(end_line);
+                    
+                    // Add new lines either directly to concave lines or to diggable queue
+                    if line_diggable(&start_line, &non_diggable_lines_tree) {
+                        diggable_lines_tree.insert(start_line);
+
+                        line_queue.push_back(LineQueueItem {
+                            line: start_line,
+                            i: line_queue_item.i, // inherit old line i
+                            next_i: current_i, // next_i becomes end line's i
+                        });
+                    } else {
+                        concave_lines.insert(line_queue_item.i, (start_line, current_i));
+                    }
+
+                    if line_diggable(&end_line, &non_diggable_lines_tree) {
+                        diggable_lines_tree.insert(end_line);
+
+                        line_queue.push_back(LineQueueItem {
+                            line: end_line,
+                            i: current_i,
+                            next_i: line_queue_item.next_i, // inherit old line's next_i
+                        });
+                    } else {
+                        concave_lines.insert(current_i, (end_line, line_queue_item.next_i));
+                    }
+                    
+                    // Increment current_i for next potential new line
+                    current_i += 1;
+                    continue;
                 }
+            }
         }
+        
         concave_lines.insert(line_queue_item.i, (line, line_queue_item.next_i));
     }
     Polygon::new(order_concave_hull(concave_lines, hull.0.len()), vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{coord, polygon};
+
+    #[test]
+    fn test_empty_coords() {
+        let coords: Vec<Coord<f64>> = vec![];
+        let hull = coords.concave_hull(None, None);
+        assert!(hull.exterior().0.is_empty());
+    }
+
+    #[test]
+    fn test_concavity() {
+        let polygon: Polygon<f64> = polygon![
+            (x: 10.0, y: 9.0),
+            (x: 10.0, y: 10.0),
+            (x: 0.0, y: 10.0),
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 9.0),
+            (x: 10.0, y: 9.0),
+        ];
+        let hull_1 = polygon.concave_hull(Some(1.0), None);
+        let hull_2 = polygon.concave_hull(Some(2.0), None);
+
+        assert_eq!(hull_1.exterior().0.len(), 7);
+        assert_eq!(hull_2.exterior().0.len(), 6);
+    }
+
+    #[test]
+    fn test_length_threshold() {
+        let coords: Vec<Coord<f64>> = vec![
+            coord! { x: 0.0, y: 0.0 },
+            coord! { x: 2.0, y: 0.0 },
+            coord! { x: 1.5, y: 1.0 },
+            coord! { x: 2.0, y: 2.0 },
+            coord! { x: 0.0, y: 2.0 },
+        ];
+
+        let correct_with_threshold = polygon![
+            (x: 2.0, y: 0.0),
+            (x: 2.0, y: 2.0),
+            (x: 0.0, y: 2.0),
+            (x: 0.0, y: 0.0),
+            (x: 2.0, y: 0.0),
+        ];
+        let hull_with_threshold = coords.concave_hull(Some(1.0), Some(3.0));
+        assert_eq!(hull_with_threshold, correct_with_threshold);
+
+        let correct_without_threshold = polygon![
+            (x: 2.0, y: 0.0),
+            (x: 1.5, y: 1.0),
+            (x: 2.0, y: 2.0),
+            (x: 0.0, y: 2.0),
+            (x: 0.0, y: 0.0),
+            (x: 2.0, y: 0.0),
+        ];
+        let hull_without_threshold = coords.concave_hull(Some(1.0), None);
+        assert_eq!(hull_without_threshold, correct_without_threshold);
+    }
+
+    // #[test]
+    // fn test_single_point() {
+    //     let coords: Vec<Coord<f64>> = vec![coord! { x: 1.0, y: 1.0 }];
+    //     let hull = coords.concave_hull(None, None);
+    //     assert_eq!(hull, Polygon::new(LineString::from()));
+    // }
+
+    // #[test]
+    // fn test_straight_line() {
+    //     let linestring: LineString<f64> = line_string![
+    //         (x: 0.0, y: 0.0),
+    //         (x: 2.0, y: 2.0),
+    //         (x: 6.0, y: 6.0),
+    //     ];
+    //     let hull = linestring.concave_hull(None, None);
+    // }
+
+    // #[test]
+    // fn test_square() {
+    //     let square: Polygon<f64> = polygon![
+    //         (x: 0.0, y: 0.0),
+    //         (x: 0.0, y: 2.0),
+    //         (x: 2.0, y: 2.0),
+    //         (x: 2.0, y: 0.0),
+    //         (x: 0.0, y: 0.0),
+    //     ];
+    //     let hull = square.concave_hull(None, None);
+    //     assert_eq!(hull, square);
+    // }
 }
