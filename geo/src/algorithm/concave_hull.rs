@@ -225,7 +225,7 @@ fn add_polygon<T>(
 where 
     T: GeoFloat + RTreeNum + BoolOpsNum + 'static,
 {
-    coords.extend(polygon.exterior().0.iter());
+    coords.extend(polygon.exterior().0.iter().skip(1));
     lines.extend(polygon.exterior().lines_iter());
 
     // Buffer the interior polygons by a small fraction of the polygon size
@@ -234,21 +234,7 @@ where
     buffered_polygons.extend(polygon.buffer(buffer_distance).0);
 }
 
-fn line_diggable<T>(
-    line: &Line<T>,
-    non_diggable_lines_tree: &Option<RTree<Line<T>>>,
-) -> bool
-where
-    T: GeoFloat + RTreeNum,
-{
-    if let Some(tree) = non_diggable_lines_tree {
-        !tree.contains(line) && !tree.contains(&Line::new(line.end, line.start))
-    } else {
-        true
-    }
-}
-
-enum RTreeNodePointer<'a, T> 
+enum RTreeNodeRef<'a, T> 
 where 
     T: GeoFloat + RTreeNum,
 {
@@ -260,7 +246,7 @@ struct QueueItem<'a, T>
 where 
     T: GeoFloat + RTreeNum,
 {
-    tree_node: RTreeNodePointer<'a, T>,
+    tree_node: RTreeNodeRef<'a, T>,
     distance: T,
 }
 
@@ -289,6 +275,20 @@ where
     }
 }
 impl<'a, T> Eq for QueueItem<'a, T> where T: GeoFloat + RTreeNum {}
+
+fn line_diggable<T>(
+    line: &Line<T>,
+    non_diggable_lines_tree: &Option<RTree<Line<T>>>,
+) -> bool
+where
+    T: GeoFloat + RTreeNum,
+{
+    if let Some(tree) = non_diggable_lines_tree {
+        !tree.contains(line) && !tree.contains(&Line::new(line.end, line.start))
+    } else {
+        true
+    }
+}
 
 fn line_to_bbox_distance<T>(line: &Line<T>, aabb: &AABB<Coord<T>>) -> T
 where
@@ -415,7 +415,6 @@ fn find_candidate<T>(
     max_length: &T,
     interior_points_tree: &RTree<Coord<T>>,
     current_hull_tree: &RTree<Line<T>>,
-    diggable_lines_tree: &RTree<Line<T>>,
     non_diggable_lines_tree: &Option<RTree<Line<T>>>,
     buffered_polygon_tree: &Option<RTree<Polygon<T>>>,
 ) -> Option<Coord<T>>
@@ -425,14 +424,14 @@ where
     // Initialize priority queue with R-tree root node
     let mut queue: BinaryHeap<QueueItem<T>> = BinaryHeap::new();
     queue.push(QueueItem {
-        tree_node: RTreeNodePointer::Parent(interior_points_tree.root()),
+        tree_node: RTreeNodeRef::Parent(interior_points_tree.root()),
         distance: T::zero(),
     });
 
     // Perform depth first search through R-tree
     while let Some(node) = queue.pop() {
         match node.tree_node {
-            RTreeNodePointer::Parent(parent) => {
+            RTreeNodeRef::Parent(parent) => {
                 for child in parent.children() {
                     match child {
                         RTreeNode::Parent(p) => {
@@ -440,7 +439,7 @@ where
                             let distance = line_to_bbox_distance(line, &envelope);
                             if distance <= *max_length {
                                 queue.push(QueueItem {
-                                    tree_node: RTreeNodePointer::Parent(p),
+                                    tree_node: RTreeNodeRef::Parent(p),
                                     distance,
                                 });
                             }
@@ -449,7 +448,7 @@ where
                             let distance = Euclidean.distance(*l, line);
                             if distance <= *max_length {
                                 queue.push(QueueItem {
-                                    tree_node: RTreeNodePointer::Leaf(l),
+                                    tree_node: RTreeNodeRef::Leaf(l),
                                     distance,
                                 });
                             }
@@ -457,12 +456,12 @@ where
                     }
                 }
             }
-            RTreeNodePointer::Leaf(leaf) => {
-                // Skip all points that are closer to another diggable line
-                // Note: This is the key divergence from MapBox's concaveman algorithm which 
-                // only checks this for the hull lines before and after the current line
-                if let Some(nearest_diggable_line) = diggable_lines_tree.nearest_neighbor(&point![x: leaf.x, y: leaf.y]) {
-                    if nearest_diggable_line == line || nearest_diggable_line == &Line::new(line.end, line.start) {
+            RTreeNodeRef::Leaf(leaf) => {
+                // Skip all points that are closer to another hull line
+                // Note: This is the key divergence from the mapbox/concaveman algorithm which 
+                // checks this for the hull lines either side of the current line
+                if let Some(nearest_line) = current_hull_tree.nearest_neighbor(&point![x: leaf.x, y: leaf.y]) {
+                    if nearest_line == line || nearest_line == &Line::new(line.end, line.start) {
                         let start_line = Line::new(line.start, *leaf);
                         let end_line = Line::new(*leaf, line.end);
 
@@ -503,6 +502,18 @@ where
     LineString::from(ordered_coords)
 }
 
+fn remove_interior_point<T>(coord: &Coord<T>, tree: &mut RTree<Coord<T>>)
+where
+    T: GeoFloat + RTreeNum,
+{
+    // TODO: Handle removing potential duplicate points better
+    // Currently decreases performance by ~5%
+    let n = tree.nearest_neighbors(coord).len();
+    for _ in 0..n {
+        tree.remove(coord);
+    }
+}
+
 struct LineQueueItem<T: GeoFloat + RTreeNum> {
     line: Line<T>,
     i: usize,
@@ -537,7 +548,6 @@ where
     // Build R-trees for interior points, hull lines and interior geometries
     let mut interior_points_tree: RTree<Coord<T>> = RTree::bulk_load(coords.to_owned());
     let mut current_hull_tree: RTree<Line<T>> = RTree::bulk_load(hull.lines().collect());
-    let mut diggable_lines_tree: RTree<Line<T>> = RTree::new();
     let non_diggable_lines_tree: Option<RTree<Line<T>>> = non_diggable_lines.map(RTree::bulk_load);
     let buffered_polygon_tree: Option<RTree<Polygon<T>>> = buffered_polygons.map(RTree::bulk_load);
 
@@ -547,7 +557,6 @@ where
     // Populate line queue with initial diggable hull lines
     for (i, line) in hull.lines().enumerate() {
         if line_diggable(&line, &non_diggable_lines_tree) {
-            diggable_lines_tree.insert(line);
             line_queue.push_back(LineQueueItem {
                 line,
                 i,
@@ -559,9 +568,9 @@ where
 
         // Remove hull points from interior points
         if i == 0 {
-            interior_points_tree.remove(&line.start);
+            remove_interior_point(&line.start, &mut interior_points_tree);
         }
-        interior_points_tree.remove(&line.end);
+        remove_interior_point(&line.end, &mut interior_points_tree);
     }
 
     // Set current hull line index for new lines
@@ -571,6 +580,7 @@ where
         let line = line_queue_item.line;
         let length = Euclidean.length(&line);
         
+        // Only consider digging if line length exceeds threshold
         if length >= length_threshold {
             let max_length = length / concavity;
             
@@ -579,7 +589,6 @@ where
                 &max_length,
                 &interior_points_tree,
                 &current_hull_tree,
-                &diggable_lines_tree,
                 &non_diggable_lines_tree,
                 &buffered_polygon_tree,
             ) {
@@ -587,26 +596,16 @@ where
                 let end_line = Line::new(candidate_point, line.end);
                 
                 if partial_min(Euclidean.length(&start_line), Euclidean.length(&end_line)) < max_length {
-                    // TODO: Handle removing potential duplicate points better
-                    // Currently decreases performance by ~5%
                     // Remove candidate point from interior points
-                    let n = interior_points_tree.nearest_neighbors(&candidate_point).len();
-                    for _ in 0..n {
-                        interior_points_tree.remove(&candidate_point);
-                    }
+                    remove_interior_point(&candidate_point, &mut interior_points_tree);
                     
-                    // Remove old hull line from trees
-                    diggable_lines_tree.remove(&line);
+                    // Update current hull tree
                     current_hull_tree.remove(&line);
-
-                    // Insert new hull lines into current hull tree
                     current_hull_tree.insert(start_line);
                     current_hull_tree.insert(end_line);
                     
                     // Add new lines either directly to concave lines or to diggable queue
                     if line_diggable(&start_line, &non_diggable_lines_tree) {
-                        diggable_lines_tree.insert(start_line);
-
                         line_queue.push_back(LineQueueItem {
                             line: start_line,
                             i: line_queue_item.i, // inherit old line i
@@ -617,8 +616,6 @@ where
                     }
 
                     if line_diggable(&end_line, &non_diggable_lines_tree) {
-                        diggable_lines_tree.insert(end_line);
-
                         line_queue.push_back(LineQueueItem {
                             line: end_line,
                             i: current_i,
@@ -664,9 +661,9 @@ mod tests {
             (x: 10.0, y: 9.0),
         ];
         let hull_1 = polygon.concave_hull(Some(1.0), None);
-        let hull_2 = polygon.concave_hull(Some(2.0), None);
-
         assert_eq!(hull_1.exterior().0.len(), 7);
+        
+        let hull_2 = polygon.concave_hull(Some(2.0), None);
         assert_eq!(hull_2.exterior().0.len(), 6);
     }
 
@@ -700,6 +697,40 @@ mod tests {
         ];
         let hull_without_threshold = coords.concave_hull(Some(1.0), None);
         assert_eq!(hull_without_threshold, correct_without_threshold);
+    }
+
+    #[test]
+    fn test_multipolygon() {
+        let multipolygon: MultiPolygon<f64> = vec![
+            polygon![
+                (x: 0.0, y: 0.0),
+                (x: 0.0, y: 2.0),
+                (x: 2.0, y: 2.0),
+                (x: 2.0, y: 0.0),
+                (x: 0.0, y: 0.0),
+            ],
+            polygon![
+                (x: 3.0, y: 0.0),
+                (x: 3.0, y: 5.0),
+                (x: 4.0, y: 5.0),
+                (x: 4.0, y: 0.0),
+                (x: 3.0, y: 0.0),
+            ],
+        ].into();
+        let hull = multipolygon.concave_hull(None, None);
+        let correct_hull = polygon![
+            (x: 4.0, y: 0.0),
+            (x: 4.0, y: 5.0),
+            (x: 3.0, y: 5.0),
+            (x: 2.0, y: 2.0),
+            (x: 0.0, y: 2.0),
+            (x: 0.0, y: 0.0),
+            (x: 2.0, y: 0.0),
+            (x: 3.0, y: 0.0),
+            (x: 4.0, y: 0.0),
+        ];
+        assert_eq!(hull, correct_hull);
+
     }
 
     // #[test]
