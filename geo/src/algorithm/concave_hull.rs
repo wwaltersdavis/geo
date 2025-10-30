@@ -61,15 +61,20 @@ pub trait ConcaveHull {
     /// # Returns
     /// * A `Polygon` representing the concave hull of the geometry.
     fn concave_hull(&self, concavity: Self::Scalar, length_threshold: Self::Scalar) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
 
     fn concave_hull_with_dig_rule(&self, concavity: Self::Scalar, length_threshold: Self::Scalar, dig_rule: DigRule) -> Polygon<Self::Scalar>;
 }
 
+/// Represents the rule used to determine which points can be used to "dig" into the hull. They are only applicable when interior geometries are present.
+/// - `AnyLine`: Only accept a candidate point when no other hull lines are closer.
+/// - `DiggableLine`: Only accept a candidate point when no other diggable hull lines are closer.
+#[derive(Default)]
 pub enum DigRule {
-    NearestHullLine,
-    NearestDiggableLine,
+    #[default]
+    AnyLine,
+    DiggableLine,
 }
 
 impl<T> ConcaveHull for MultiPoint<T>
@@ -78,12 +83,13 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
 
+    // TODO: only have concave_hull for MultiPoint, Vec<Coord> and [Coord]
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
         let mut coords: Vec<Coord<T>> = self.iter().map(|point| point.0).collect();
-        concave_hull_with_dig_rule(&mut coords, concavity, length_threshold, DigRule::NearestHullLine, None, None)
+        concave_hull_with_dig_rule(&mut coords, concavity, length_threshold, DigRule::AnyLine, None, None)
     }
 }
 
@@ -93,7 +99,7 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
 
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
@@ -111,7 +117,7 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
 
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
@@ -131,7 +137,7 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
 
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
@@ -146,7 +152,7 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
         let mut coords: Vec<Coord<T>> = self.iter().flat_map(|elem| elem.0.clone()).collect();
@@ -161,7 +167,7 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
         let mut coords: Vec<Coord<T>> = Vec::new();
@@ -178,12 +184,12 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
 
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
         let mut coords: Vec<Coord<T>> = self.clone();
-        concave_hull_with_dig_rule(&mut coords, concavity, length_threshold, DigRule::NearestHullLine, None, None)
+        concave_hull_with_dig_rule(&mut coords, concavity, length_threshold, DigRule::AnyLine, None, None)
     }
 }
 
@@ -193,11 +199,11 @@ where
 {
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
-        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::NearestHullLine)
+        self.concave_hull_with_dig_rule(concavity, length_threshold, DigRule::AnyLine)
     }
     fn concave_hull_with_dig_rule(&self, concavity: T, length_threshold: T, dig_rule: DigRule) -> Polygon<Self::Scalar> {
         let mut coords: Vec<Coord<T>> = self.to_vec();
-        concave_hull_with_dig_rule(&mut coords, concavity, length_threshold, DigRule::NearestHullLine, None, None)
+        concave_hull_with_dig_rule(&mut coords, concavity, length_threshold, DigRule::AnyLine, None, None)
     }
 }
 
@@ -597,7 +603,7 @@ where
             });
         } else {
             concave_lines.insert(i, (line, i + 1));
-            if matches!(dig_rule, DigRule::NearestDiggableLine) {
+            if matches!(dig_rule, DigRule::DiggableLine) {
                 current_hull_tree.remove(&line);
             }
         }
@@ -649,7 +655,7 @@ where
                         });
                     } else {
                         concave_lines.insert(line_queue_item.i, (start_line, current_i));
-                        if matches!(dig_rule, DigRule::NearestDiggableLine) {
+                        if matches!(dig_rule, DigRule::DiggableLine) {
                             current_hull_tree.remove(&start_line);
                         }
                     }
@@ -662,7 +668,7 @@ where
                         });
                     } else {
                         concave_lines.insert(current_i, (end_line, line_queue_item.next_i));
-                        if matches!(dig_rule, DigRule::NearestDiggableLine) {
+                        if matches!(dig_rule, DigRule::DiggableLine) {
                             current_hull_tree.remove(&end_line);
                         }
                     }
