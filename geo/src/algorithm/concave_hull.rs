@@ -1,9 +1,10 @@
+use crate::algorithm::Kernel;
 use crate::convex_hull::qhull;
 use crate::utils::partial_min;
 use crate::{
-    Coord, CoordNum, Distance, Euclidean, GeoFloat, Geometry, GeometryCollection, 
-    Intersects, Length, Line, LinesIter, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon,
-    coord, point,
+    Coord, CoordNum, Distance, Euclidean, GeoFloat, Geometry, GeometryCollection, Intersects,
+    Length, Line, LineString, LinesIter, MultiLineString, MultiPoint, MultiPolygon, Orientation,
+    Polygon, coord, point,
 };
 use rstar::{AABB, Envelope, ParentNode, RTree, RTreeNode, RTreeNum};
 use std::{
@@ -26,13 +27,13 @@ use std::{
 ///
 /// // a collection of points
 /// let points: MultiPoint<_> = vec![
-///     (0.0, 0.0), 
+///     (0.0, 0.0),
 ///     (2.0, 0.0),
 ///     (1.5, 1.0),
 ///     (2.0, 2.0),
 ///     (0.0, 2.0),
 /// ].into();
-/// 
+///
 /// let correct_hull = polygon![
 ///     (x: 2.0, y: 0.0),
 ///     (x: 1.5, y: 1.0),
@@ -41,7 +42,7 @@ use std::{
 ///     (x: 0.0, y: 0.0),
 ///     (x: 2.0, y: 0.0),
 /// ];
-/// 
+///
 /// let hull = points.concave_hull(1.0, 0.0);
 /// assert_eq!(hull, correct_hull);
 /// ```
@@ -49,17 +50,21 @@ pub trait ConcaveHull {
     type Scalar: CoordNum;
 
     /// Create a new polygon as the concave hull of the geometry.
-    /// 
+    ///
     /// # Arguments
     /// * `concavity` - A relative measure of how concave the hull should be. Higher values result in a more
     ///   concave hull. Inifinity would result in a convex hull. 2.0 results in a relatively detailed shape.
-    /// 
-    /// * `length_threshold` - The minimum length of constituent hull lines. Lines shorter than this will not be 
+    ///
+    /// * `length_threshold` - The minimum length of constituent hull lines. Lines shorter than this will not be
     ///   drilled down any further. Set to 0.0 if for no threshold.
-    /// 
+    ///
     /// # Returns
     /// * A `Polygon` representing the concave hull of the geometry.
-    fn concave_hull(&self, concavity: Self::Scalar, length_threshold: Self::Scalar) -> Polygon<Self::Scalar>;
+    fn concave_hull(
+        &self,
+        concavity: Self::Scalar,
+        length_threshold: Self::Scalar,
+    ) -> Polygon<Self::Scalar>;
 }
 
 impl<T> ConcaveHull for MultiPoint<T>
@@ -83,7 +88,13 @@ where
         let mut lines: Vec<Line<T>> = Vec::new();
         let mut polygons: Vec<Polygon<T>> = Vec::new();
         add_polygon(self, &mut coords, &mut lines, &mut polygons);
-        concave_hull(&mut coords, concavity, length_threshold, Some(lines), Some(polygons))
+        concave_hull(
+            &mut coords,
+            concavity,
+            length_threshold,
+            Some(lines),
+            Some(polygons),
+        )
     }
 }
 
@@ -99,7 +110,13 @@ where
         for polygon in self.0.iter() {
             add_polygon(polygon, &mut coords, &mut lines, &mut polygons);
         }
-        concave_hull(&mut coords, concavity, length_threshold, Some(lines), Some(polygons))
+        concave_hull(
+            &mut coords,
+            concavity,
+            length_threshold,
+            Some(lines),
+            Some(polygons),
+        )
     }
 }
 
@@ -110,7 +127,13 @@ where
     type Scalar = T;
     fn concave_hull(&self, concavity: T, length_threshold: T) -> Polygon<Self::Scalar> {
         let lines: Vec<Line<T>> = self.lines().collect();
-        concave_hull(&mut self.0.clone(), concavity, length_threshold, Some(lines), None)
+        concave_hull(
+            &mut self.0.clone(),
+            concavity,
+            length_threshold,
+            Some(lines),
+            None,
+        )
     }
 }
 
@@ -136,7 +159,13 @@ where
         let mut lines: Vec<Line<T>> = Vec::new();
         let mut polygons: Vec<Polygon<T>> = Vec::new();
         add_geometry_collection(self, &mut coords, &mut lines, &mut polygons);
-        concave_hull(&mut coords, concavity, length_threshold, Some(lines), Some(polygons))
+        concave_hull(
+            &mut coords,
+            concavity,
+            length_threshold,
+            Some(lines),
+            Some(polygons),
+        )
     }
 }
 
@@ -167,8 +196,7 @@ fn add_polygon<T>(
     coords: &mut Vec<Coord<T>>,
     lines: &mut Vec<Line<T>>,
     polygons: &mut Vec<Polygon<T>>,
-) 
-where 
+) where
     T: GeoFloat + RTreeNum,
 {
     coords.extend(polygon.exterior().0.iter().skip(1));
@@ -181,8 +209,7 @@ fn add_geometry_collection<T>(
     coords: &mut Vec<Coord<T>>,
     lines: &mut Vec<Line<T>>,
     polygons: &mut Vec<Polygon<T>>,
-)
-where
+) where
     T: GeoFloat + RTreeNum,
 {
     for geometry in collection.0.iter() {
@@ -229,52 +256,49 @@ where
     }
 }
 
-enum RTreeNodeRef<'a, T> 
-where 
+enum RTreeNodeRef<'a, T>
+where
     T: GeoFloat + RTreeNum,
 {
     Parent(&'a ParentNode<Coord<T>>),
     Leaf(&'a Coord<T>),
 }
 
-struct QueueItem<'a, T> 
-where 
+struct NodeQueueItem<'a, T>
+where
     T: GeoFloat + RTreeNum,
 {
     tree_node: RTreeNodeRef<'a, T>,
     distance: T,
 }
 
-impl<'a, T> Ord for QueueItem<'a, T> 
-where 
+impl<'a, T> Ord for NodeQueueItem<'a, T>
+where
     T: GeoFloat + RTreeNum,
 {
     fn cmp(&self, other: &Self) -> Ordering {
         other.distance.partial_cmp(&self.distance).unwrap()
     }
 }
-impl<'a, T> PartialOrd for QueueItem<'a, T> 
-where 
+impl<'a, T> PartialOrd for NodeQueueItem<'a, T>
+where
     T: GeoFloat + RTreeNum,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl<'a, T> PartialEq for QueueItem<'a, T> 
-where 
+impl<'a, T> PartialEq for NodeQueueItem<'a, T>
+where
     T: GeoFloat + RTreeNum,
 {
     fn eq(&self, other: &Self) -> bool {
         self.distance == other.distance
     }
 }
-impl<'a, T> Eq for QueueItem<'a, T> where T: GeoFloat + RTreeNum {}
+impl<'a, T> Eq for NodeQueueItem<'a, T> where T: GeoFloat + RTreeNum {}
 
-fn is_interior_line<T>(
-    line: &Line<T>,
-    interior_lines_tree: &Option<RTree<Line<T>>>,
-) -> bool
+fn is_interior_line<T>(line: &Line<T>, interior_lines_tree: &Option<RTree<Line<T>>>) -> bool
 where
     T: GeoFloat + RTreeNum,
 {
@@ -292,10 +316,10 @@ where
     if aabb.contains_point(&line.start) || aabb.contains_point(&line.end) {
         return T::zero();
     }
-    let c1 = coord!{x: aabb.lower().x, y: aabb.lower().y};
-    let c2 = coord!{x: aabb.lower().x, y: aabb.upper().y};
-    let c3 = coord!{x: aabb.upper().x, y: aabb.upper().y};
-    let c4 = coord!{x: aabb.upper().x, y: aabb.lower().y};
+    let c1 = coord! {x: aabb.lower().x, y: aabb.lower().y};
+    let c2 = coord! {x: aabb.lower().x, y: aabb.upper().y};
+    let c3 = coord! {x: aabb.upper().x, y: aabb.upper().y};
+    let c4 = coord! {x: aabb.upper().x, y: aabb.lower().y};
     let d1 = Euclidean.distance(line, &Line::new(c1, c4));
     if d1 == T::zero() {
         return d1;
@@ -316,7 +340,7 @@ where
 }
 
 fn no_hull_intersections<T>(line: &Line<T>, current_hull_tree: &RTree<Line<T>>) -> bool
-where 
+where
     T: GeoFloat + RTreeNum,
 {
     let min_x = T::min(line.start.x, line.end.x);
@@ -326,8 +350,11 @@ where
     let bbox = AABB::from_corners(point!([min_x, min_y]), point!([max_x, max_y]));
     let hull_lines = current_hull_tree.locate_in_envelope_intersecting(&bbox);
     for hull_line in hull_lines {
-        if hull_line.start == line.start || hull_line.start == line.end ||
-           hull_line.end == line.start || hull_line.end == line.end {
+        if hull_line.start == line.start
+            || hull_line.start == line.end
+            || hull_line.end == line.start
+            || hull_line.end == line.end
+        {
             continue;
         }
         if line.intersects(hull_line) {
@@ -337,32 +364,58 @@ where
     true
 }
 
-fn offset_intersects<T, G>(line: &Line<T>, interior_geometry: &G, offset: T) -> bool 
+fn offset_intersects<T, G>(line: &Line<T>, interior_geometry: &G, offset: T) -> bool
 where
     T: GeoFloat,
     G: Intersects<Line<T>>,
 {
-    // Shift the line each way along the x and y axis to check if the line is just 
+    // Shift the line each way along the x and y axis to check if the line is just
     // touching the interior geometry.
     interior_geometry.intersects(&Line::new(
         point!(x: line.start.x + offset, y: line.start.y),
         point!(x: line.end.x + offset, y: line.end.y),
-    )) && 
-    interior_geometry.intersects(&Line::new(
+    )) && interior_geometry.intersects(&Line::new(
         point!(x: line.start.x - offset, y: line.start.y),
         point!(x: line.end.x - offset, y: line.end.y),
-    )) && 
-    interior_geometry.intersects(&Line::new(
+    )) && interior_geometry.intersects(&Line::new(
         point!(x: line.start.x, y: line.start.y + offset),
         point!(x: line.end.x, y: line.end.y + offset),
-    )) && 
-    interior_geometry.intersects(&Line::new(
+    )) && interior_geometry.intersects(&Line::new(
         point!(x: line.start.x, y: line.start.y - offset),
         point!(x: line.end.x, y: line.end.y - offset),
     ))
 }
 
-fn no_interior_line_intersections<T>(line: &Line<T>, tree: &Option<RTree<Line<T>>>) -> bool 
+fn transverse_intersection<T>(line_a: &Line<T>, line_b: &Line<T>) -> bool
+where
+    T: GeoFloat,
+{
+    // Only return true if they two lines have a transverse intersection.
+    // Otherwise if they do not intersect or intersect tangentially return false.
+
+    // Get orientation of line_a's start/end with respect to line_b.
+    let check_1_1 = T::Ker::orient2d(line_b.start, line_b.end, line_a.start);
+    let check_1_2 = T::Ker::orient2d(line_b.start, line_b.end, line_a.end);
+
+    // If both orientations are the same or either orientation is collinear, this is not breaking the line.
+    if check_1_1 == check_1_2
+        || check_1_1 == Orientation::Collinear
+        || check_1_2 == Orientation::Collinear
+    {
+        return false;
+    }
+
+    // Get orientation of line_b's start/end with respect to line_a.
+    let check_2_1 = T::Ker::orient2d(line_a.start, line_a.end, line_b.start);
+    let check_2_2 = T::Ker::orient2d(line_a.start, line_a.end, line_b.end);
+
+    // Return true only if the orientations are different and neither is collinear.
+    check_2_1 != check_2_2
+        && check_2_1 != Orientation::Collinear
+        && check_2_2 != Orientation::Collinear
+}
+
+fn breaks_interior_lines<T>(line: &Line<T>, tree: &Option<RTree<Line<T>>>) -> bool
 where
     T: GeoFloat + RTreeNum,
 {
@@ -373,18 +426,24 @@ where
         let max_y = T::max(line.start.y, line.end.y);
         let bbox = AABB::from_corners(point!([min_x, min_y]), point!([max_x, max_y]));
         let lines = tree.locate_in_envelope_intersecting(&bbox);
-        let shift = Euclidean.length(line) * T::from(1e-6).unwrap();
         for interior_line in lines {
-            if offset_intersects(line, interior_line, shift) {
-                return false;
+            if interior_line.start == line.start
+                || interior_line.start == line.end
+                || interior_line.end == line.start
+                || interior_line.end == line.end
+            {
+                continue;
+            }
+            if transverse_intersection(line, interior_line) {
+                return true;
             }
         }
     }
-    true
+    false
 }
 
-fn contract_line<T>(line: &Line<T>, offset: T) -> Line<T> 
-where    
+fn contract_line<T>(line: &Line<T>, offset: T) -> Line<T>
+where
     T: GeoFloat,
 {
     // Contract the line from either end by the offset distance
@@ -396,14 +455,14 @@ where
 
     let offset_x = dx * offset;
     let offset_y = dy * offset;
-    
+
     Line::new(
         coord! { x: start.x + offset_x, y: start.y + offset_y },
         coord! { x: end.x - offset_x, y: end.y - offset_y },
     )
 }
 
-fn no_interior_polygon_intersections<T>(line: &Line<T>, tree: &Option<RTree<Polygon<T>>>) -> bool 
+fn no_interior_polygon_intersections<T>(line: &Line<T>, tree: &Option<RTree<Polygon<T>>>) -> bool
 where
     T: GeoFloat + RTreeNum,
 {
@@ -442,8 +501,8 @@ where
     let line = hull_lines.get(&line_queue_item.i).unwrap();
 
     // Initialize priority queue with R-tree root node
-    let mut queue: BinaryHeap<QueueItem<T>> = BinaryHeap::new();
-    queue.push(QueueItem {
+    let mut queue: BinaryHeap<NodeQueueItem<T>> = BinaryHeap::new();
+    queue.push(NodeQueueItem {
         tree_node: RTreeNodeRef::Parent(interior_points_tree.root()),
         distance: T::zero(),
     });
@@ -458,7 +517,7 @@ where
                             let envelope = p.envelope();
                             let distance = line_to_bbox_distance(line, &envelope);
                             if distance <= *max_length {
-                                queue.push(QueueItem {
+                                queue.push(NodeQueueItem {
                                     tree_node: RTreeNodeRef::Parent(p),
                                     distance,
                                 });
@@ -467,7 +526,7 @@ where
                         RTreeNode::Leaf(l) => {
                             let distance = Euclidean.distance(*l, line);
                             if distance <= *max_length {
-                                queue.push(QueueItem {
+                                queue.push(NodeQueueItem {
                                     tree_node: RTreeNodeRef::Leaf(l),
                                     distance,
                                 });
@@ -478,19 +537,23 @@ where
             }
             RTreeNodeRef::Leaf(leaf) => {
                 // Skip candidate points that as close to adjacent edges
-                if node.distance >= Euclidean.distance(*leaf, hull_lines.get(&line_queue_item.prev_i).unwrap()) || 
-                   node.distance >= Euclidean.distance(*leaf, hull_lines.get(&line_queue_item.next_i).unwrap()) {
+                if node.distance
+                    >= Euclidean.distance(*leaf, hull_lines.get(&line_queue_item.prev_i).unwrap())
+                    || node.distance
+                        >= Euclidean
+                            .distance(*leaf, hull_lines.get(&line_queue_item.next_i).unwrap())
+                {
                     continue;
                 }
                 let start_line = Line::new(line.start, *leaf);
                 let end_line = Line::new(*leaf, line.end);
 
                 // Skip candidate point if it would cause intersections with hull lines or interior geometries
-                if no_hull_intersections(&start_line, current_hull_tree) 
+                if no_hull_intersections(&start_line, current_hull_tree)
                     && no_hull_intersections(&end_line, current_hull_tree)
-                    && no_interior_line_intersections(&start_line, interior_lines_tree) 
-                    && no_interior_line_intersections(&end_line, interior_lines_tree)
-                    && no_interior_polygon_intersections(&start_line, interior_polygon_tree) 
+                    && !breaks_interior_lines(&start_line, interior_lines_tree)
+                    && !breaks_interior_lines(&end_line, interior_lines_tree)
+                    && no_interior_polygon_intersections(&start_line, interior_polygon_tree)
                     && no_interior_polygon_intersections(&end_line, interior_polygon_tree)
                 {
                     return Some(*leaf);
@@ -501,7 +564,10 @@ where
     None
 }
 
-fn order_concave_hull<T>(hull_order: HashMap<usize, usize>, hull_lines: HashMap<usize, Line<T>>) -> LineString<T>
+fn order_concave_hull<T>(
+    hull_order: HashMap<usize, usize>,
+    hull_lines: HashMap<usize, Line<T>>,
+) -> LineString<T>
 where
     T: GeoFloat,
 {
@@ -537,8 +603,8 @@ struct LineQueueItem<T: GeoFloat + RTreeNum> {
 
 fn concave_hull<T>(
     coords: &mut [Coord<T>],
-    concavity: T, 
-    length_threshold: T, 
+    concavity: T,
+    length_threshold: T,
     interior_lines: Option<Vec<Line<T>>>,
     interior_polygons: Option<Vec<Polygon<T>>>,
 ) -> Polygon<T>
@@ -550,7 +616,7 @@ where
 
     // Compute initial convex hull
     let hull = qhull::quick_hull(coords);
-    
+
     // Return convex hull if less than 4 points
     if coords.len() < 4 {
         return Polygon::new(hull, vec![]);
@@ -596,11 +662,11 @@ where
     while let Some(line_queue_item) = line_queue.pop_front() {
         let line = line_queue_item.line;
         let length = Euclidean.length(&line);
-        
+
         // Only consider drilling down if line length exceeds threshold
         if length > length_threshold {
             let max_length = length / concavity;
-            
+
             if let Some(candidate_point) = find_candidate(
                 &line_queue_item,
                 &max_length,
@@ -612,11 +678,13 @@ where
             ) {
                 let start_line = Line::new(line.start, candidate_point);
                 let end_line = Line::new(candidate_point, line.end);
-                
-                if partial_min(Euclidean.length(&start_line), Euclidean.length(&end_line)) < max_length {
+
+                if partial_min(Euclidean.length(&start_line), Euclidean.length(&end_line))
+                    < max_length
+                {
                     // Remove candidate point from interior points
                     remove_interior_point(&candidate_point, &mut interior_points_tree);
-                    
+
                     // Update current hull tree
                     current_hull_tree.remove(&line);
                     current_hull_tree.insert(start_line);
@@ -625,7 +693,7 @@ where
                     // Update hull lines
                     hull_lines.insert(line_queue_item.i, start_line);
                     hull_lines.insert(current_i, end_line);
-                    
+
                     // Either push line to queue or add confirmed line to hull order
                     if !is_interior_line(&start_line, &interior_lines_tree) {
                         line_queue.push_back(LineQueueItem {
@@ -648,14 +716,14 @@ where
                     } else {
                         hull_order.insert(current_i, line_queue_item.next_i);
                     }
-                    
+
                     // Increment current_i for next new potential hull line
                     current_i += 1;
                     continue;
                 }
             }
         }
-        
+
         hull_order.insert(line_queue_item.i, line_queue_item.next_i);
     }
     Polygon::new(order_concave_hull(hull_order, hull_lines), vec![])
@@ -686,7 +754,7 @@ mod tests {
         ];
         let hull_1 = polygon.concave_hull(1.0, 0.0);
         assert_eq!(hull_1.exterior().0.len(), 7);
-        
+
         let hull_2 = polygon.concave_hull(2.0, 0.0);
         assert_eq!(hull_2.exterior().0.len(), 6);
     }
@@ -741,7 +809,8 @@ mod tests {
                 (x: 4.0, y: 0.0),
                 (x: 3.0, y: 0.0),
             ],
-        ].into();
+        ]
+        .into();
         let hull = multipolygon.concave_hull(2.0, 0.0);
         let correct_hull = polygon![
             (x: 4.0, y: 0.0),
@@ -755,7 +824,6 @@ mod tests {
             (x: 4.0, y: 0.0),
         ];
         assert_eq!(hull, correct_hull);
-
     }
 
     #[test]
