@@ -1,8 +1,9 @@
 use crate::algorithm::Kernel;
+use crate::coordinate_position::CoordPos;
 use crate::convex_hull::qhull;
 use crate::utils::partial_min;
 use crate::{
-    Coord, CoordNum, Distance, Euclidean, GeoFloat, Geometry, GeometryCollection, Intersects,
+    Coord, CoordinatePosition, CoordNum, Distance, Euclidean, GeoFloat, Geometry, GeometryCollection, Intersects,
     Length, Line, LineString, LinesIter, MultiLineString, MultiPoint, MultiPolygon, Orientation,
     Polygon, coord, point,
 };
@@ -364,28 +365,6 @@ where
     true
 }
 
-fn offset_intersects<T, G>(line: &Line<T>, interior_geometry: &G, offset: T) -> bool
-where
-    T: GeoFloat,
-    G: Intersects<Line<T>>,
-{
-    // Shift the line each way along the x and y axis to check if the line is just
-    // touching the interior geometry.
-    interior_geometry.intersects(&Line::new(
-        point!(x: line.start.x + offset, y: line.start.y),
-        point!(x: line.end.x + offset, y: line.end.y),
-    )) && interior_geometry.intersects(&Line::new(
-        point!(x: line.start.x - offset, y: line.start.y),
-        point!(x: line.end.x - offset, y: line.end.y),
-    )) && interior_geometry.intersects(&Line::new(
-        point!(x: line.start.x, y: line.start.y + offset),
-        point!(x: line.end.x, y: line.end.y + offset),
-    )) && interior_geometry.intersects(&Line::new(
-        point!(x: line.start.x, y: line.start.y - offset),
-        point!(x: line.end.x, y: line.end.y - offset),
-    ))
-}
-
 fn transverse_intersection<T>(line_a: &Line<T>, line_b: &Line<T>) -> bool
 where
     T: GeoFloat,
@@ -442,27 +421,7 @@ where
     false
 }
 
-fn contract_line<T>(line: &Line<T>, offset: T) -> Line<T>
-where
-    T: GeoFloat,
-{
-    // Contract the line from either end by the offset distance
-    let start = line.start;
-    let end = line.end;
-
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-
-    let offset_x = dx * offset;
-    let offset_y = dy * offset;
-
-    Line::new(
-        coord! { x: start.x + offset_x, y: start.y + offset_y },
-        coord! { x: end.x - offset_x, y: end.y - offset_y },
-    )
-}
-
-fn no_interior_polygon_intersections<T>(line: &Line<T>, tree: &Option<RTree<Polygon<T>>>) -> bool
+fn breaks_interior_polygons<T>(line: &Line<T>, tree: &Option<RTree<Polygon<T>>>) -> bool
 where
     T: GeoFloat + RTreeNum,
 {
@@ -473,17 +432,18 @@ where
         let max_y = T::max(line.start.y, line.end.y);
         let bbox = AABB::from_corners(point!([min_x, min_y]), point!([max_x, max_y]));
 
-        let offset = Euclidean.length(line) * T::from(1e-7).unwrap();
-        let contracted_line = contract_line(line, offset * T::from(100.0).unwrap());
-
         let interior_polygons = tree.locate_in_envelope_intersecting(&bbox);
         for interior_polygon in interior_polygons {
-            if offset_intersects(&contracted_line, interior_polygon, offset) {
-                return false;
+            // Only need to check if either end of the line is inside the polygon.
+            // The intersections with interior lines is covered with `breaks_interior_lines`.
+            if interior_polygon.coordinate_position(&line.start) == CoordPos::Inside
+                || interior_polygon.coordinate_position(&line.end) == CoordPos::Inside
+            {
+                return true;
             }
         }
     }
-    true
+    false
 }
 
 fn find_candidate<T>(
@@ -553,8 +513,8 @@ where
                     && no_hull_intersections(&end_line, current_hull_tree)
                     && !breaks_interior_lines(&start_line, interior_lines_tree)
                     && !breaks_interior_lines(&end_line, interior_lines_tree)
-                    && no_interior_polygon_intersections(&start_line, interior_polygon_tree)
-                    && no_interior_polygon_intersections(&end_line, interior_polygon_tree)
+                    && !breaks_interior_polygons(&start_line, interior_polygon_tree)
+                    && !breaks_interior_polygons(&end_line, interior_polygon_tree)
                 {
                     return Some(*leaf);
                 }
@@ -844,6 +804,17 @@ mod tests {
             (x: 2.0, y: 0.0),
         ];
         assert_eq!(hull, correct_hull);
+    }
+
+    #[test]
+    fn test_transverse_intersection() {
+        let line_a = Line::new(coord! { x: 0.0, y: 0.0 }, coord! { x: 2.0, y: 2.0 });
+        let line_b = Line::new(coord! { x: 0.0, y: 2.0 }, coord! { x: 2.0, y: 0.0 });
+        assert!(transverse_intersection(&line_a, &line_b));
+
+        let line_c = Line::new(coord! { x: 0.0, y: 0.0 }, coord! { x: 2.0, y: 0.0 });
+        let line_d = Line::new(coord! { x: 1.0, y: 0.0 }, coord! { x: 1.0, y: 3.0 });
+        assert!(!transverse_intersection(&line_c, &line_d));
     }
 
     // #[test]
