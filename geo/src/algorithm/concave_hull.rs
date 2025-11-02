@@ -23,7 +23,7 @@ use std::{
 ///
 /// # Examples
 /// ```
-/// use geo::{line_string, MultiPoint};
+/// use geo::{polygon, MultiPoint};
 /// use geo::ConcaveHull;
 ///
 /// // a collection of points
@@ -365,12 +365,12 @@ where
     true
 }
 
-fn transverse_intersection<T>(line_a: &Line<T>, line_b: &Line<T>) -> bool
+fn proper_intersection<T>(line_a: &Line<T>, line_b: &Line<T>) -> bool
 where
     T: GeoFloat,
 {
-    // Only return true if they two lines have a transverse intersection.
-    // Otherwise if they do not intersect or intersect tangentially return false.
+    // Intersections are only true when the lines intersect and the point of intersection is 
+    // not an endpoint of either line.
 
     // Get orientation of line_a's start/end with respect to line_b.
     let check_1_1 = T::Ker::orient2d(line_b.start, line_b.end, line_a.start);
@@ -413,7 +413,7 @@ where
             {
                 continue;
             }
-            if transverse_intersection(line, interior_line) {
+            if proper_intersection(line, interior_line) {
                 return true;
             }
         }
@@ -807,14 +807,14 @@ mod tests {
     }
 
     #[test]
-    fn test_transverse_intersection() {
+    fn test_proper_intersection() {
         let line_a = Line::new(coord! { x: 0.0, y: 0.0 }, coord! { x: 2.0, y: 2.0 });
         let line_b = Line::new(coord! { x: 0.0, y: 2.0 }, coord! { x: 2.0, y: 0.0 });
-        assert!(transverse_intersection(&line_a, &line_b));
+        assert!(proper_intersection(&line_a, &line_b));
 
         let line_c = Line::new(coord! { x: 0.0, y: 0.0 }, coord! { x: 2.0, y: 0.0 });
         let line_d = Line::new(coord! { x: 1.0, y: 0.0 }, coord! { x: 1.0, y: 3.0 });
-        assert!(!transverse_intersection(&line_c, &line_d));
+        assert!(!proper_intersection(&line_c, &line_d));
     }
 
     // #[test]
