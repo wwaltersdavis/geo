@@ -3,9 +3,9 @@ use crate::convex_hull::qhull;
 use crate::coordinate_position::CoordPos;
 use crate::utils::partial_min;
 use crate::{
-    Contains, Coord, CoordinatePosition, Distance, Euclidean, GeoFloat, Intersects, Length, Line,
-    LineString, LinesIter, MultiLineString, MultiPoint, MultiPolygon, Orientation, Point, Polygon,
-    Triangle, coord, point,
+    Contains, Coord, CoordinatePosition, Distance, Euclidean, GeoFloat, Geometry,
+    GeometryCollection, Intersects, Length, Line, LineString, LinesIter, MultiLineString,
+    MultiPoint, MultiPolygon, Orientation, Point, Polygon, Triangle, coord, point,
 };
 use rstar::{AABB, Envelope, ParentNode, RTree, RTreeNode, RTreeNum};
 use std::{
@@ -218,6 +218,28 @@ where
     }
 }
 
+impl<T> ConcaveHull for GeometryCollection<T>
+where
+    T: GeoFloat + RTreeNum,
+{
+    type Scalar = T;
+    fn concave_hull_with_options(
+        &self,
+        concave_hull_options: ConcaveHullOptions<Self::Scalar>,
+    ) -> Polygon<T> {
+        let mut coords: Vec<Coord<T>> = Vec::new();
+        let mut lines: Vec<Line<T>> = Vec::new();
+        let mut polygons: Vec<Polygon<T>> = Vec::new();
+        extend_with_geometry_collection(self, &mut coords, &mut lines, &mut polygons);
+        concave_hull_with_options(
+            &mut coords,
+            concave_hull_options,
+            Some(lines),
+            Some(polygons),
+        )
+    }
+}
+
 impl<T> ConcaveHull for Vec<Coord<T>>
 where
     T: GeoFloat + RTreeNum,
@@ -345,6 +367,59 @@ fn extend_with_polygon<T>(
     coords.extend(polygon.exterior().0.iter().skip(1));
     lines.extend(polygon.exterior().lines_iter());
     polygons.push(Polygon::new(polygon.exterior().clone(), vec![]));
+}
+
+fn extend_with_geometry_collection<T>(
+    collection: &GeometryCollection<T>,
+    coords: &mut Vec<Coord<T>>,
+    lines: &mut Vec<Line<T>>,
+    polygons: &mut Vec<Polygon<T>>,
+) where
+    T: GeoFloat + RTreeNum,
+{
+    // Add all geometries in the collection to coords, lines, and polygons
+    for geometry in collection.0.iter() {
+        match geometry {
+            Geometry::Point(point) => {
+                coords.push(point.0);
+            }
+            Geometry::MultiPoint(multi_point) => {
+                coords.extend(multi_point.iter().map(|p| p.0));
+            }
+            Geometry::Line(line) => {
+                coords.push(line.start);
+                coords.push(line.end);
+                lines.push(*line);
+            }
+            Geometry::LineString(line_string) => {
+                coords.extend(line_string.0.iter());
+                lines.extend(line_string.lines());
+            }
+            Geometry::MultiLineString(multi_line_string) => {
+                for line_string in multi_line_string.iter() {
+                    coords.extend(line_string.0.iter());
+                    lines.extend(line_string.lines());
+                }
+            }
+            Geometry::Polygon(polygon) => {
+                extend_with_polygon(polygon, coords, lines, polygons);
+            }
+            Geometry::MultiPolygon(multi_polygon) => {
+                for polygon in multi_polygon.iter() {
+                    extend_with_polygon(polygon, coords, lines, polygons);
+                }
+            }
+            Geometry::Triangle(triangle) => {
+                extend_with_polygon(&Polygon::from(*triangle), coords, lines, polygons);
+            }
+            Geometry::Rect(rect) => {
+                extend_with_polygon(&Polygon::from(*rect), coords, lines, polygons);
+            }
+            Geometry::GeometryCollection(nested_collection) => {
+                extend_with_geometry_collection(nested_collection, coords, lines, polygons);
+            }
+        }
+    }
 }
 
 fn line_to_bbox_distance<T>(line: &Line<T>, bbox: &AABB<Coord<T>>) -> T
@@ -817,7 +892,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{coord, line_string, polygon};
+    use crate::{Rect, coord, line_string, polygon};
 
     #[test]
     fn test_concavity() {
@@ -1069,5 +1144,102 @@ mod tests {
         for coord in coords.iter() {
             assert!(hull.intersects(coord));
         }
+    }
+
+    #[test]
+    fn test_geometry_collection() {
+        let gc: GeometryCollection<f64> = vec![
+            Geometry::Point(coord! { x: 1.0, y: 2.5 }.into()),
+            Geometry::MultiPoint(vec![coord! { x: 1.6, y: 2.4 }, coord! { x: 0.9, y: 3.1 }].into()),
+            Geometry::Line(Line::new(
+                coord! { x: 0.3, y: 5.0 },
+                coord! { x: 1.1, y: 6.0 },
+            )),
+            Geometry::LineString(line_string![
+                (x: 0.3, y: 3.8),
+                (x: 1.4, y: 3.8),
+                (x: 2.2, y: 4.5),
+            ]),
+            Geometry::MultiLineString(MultiLineString::new(vec![
+                line_string![
+                    (x: 1.8, y: 5.0),
+                    (x: 1.8, y: 6.0),
+                ],
+                line_string![
+                    (x: 3.2, y: 5.0),
+                    (x: 3.2, y: 6.0),
+                ],
+            ])),
+            Geometry::Polygon(polygon![
+                (x: 2.0, y: 2.0),
+                (x: 3.0, y: 0.0),
+                (x: 3.0, y: 1.0),
+                (x: 2.0, y: 1.0),
+                (x: 2.0, y: 2.0),
+            ]),
+            Geometry::MultiPolygon(MultiPolygon::new(vec![
+                polygon![
+                    (x: 3.0, y: 3.0),
+                    (x: 4.2, y: 3.0),
+                    (x: 4.2, y: 4.4),
+                    (x: 3.0, y: 4.0),
+                    (x: 3.0, y: 3.0),
+                ],
+                polygon![
+                    (x: 4.6, y: 2.7),
+                    (x: 5.0, y: 2.7),
+                    (x: 5.0, y: 3.6),
+                    (x: 4.6, y: 3.6),
+                    (x: 4.6, y: 2.7),
+                ],
+            ])),
+            Geometry::Triangle(Triangle::new(
+                coord! { x: 2.1, y: 1.8 },
+                coord! { x: 2.9, y: 1.8 },
+                coord! { x: 2.5, y: 3.1 },
+            )),
+            Geometry::Rect(Rect::new(
+                coord! { x: -0.3, y: 2.7 },
+                coord! { x: 0.1, y: 3.6 },
+            )),
+            Geometry::GeometryCollection(
+                vec![
+                    Geometry::Point(coord! { x: 1.6, y: 3.0 }.into()),
+                    Geometry::Line(Line::new(
+                        coord! { x: 4.0, y: 6.0 },
+                        coord! { x: 5.0, y: 5.0 },
+                    )),
+                ]
+                .into(),
+            ),
+        ]
+        .into();
+        let hull = gc.concave_hull();
+        let correct_hull = polygon![
+            (x: 3.0, y: 0.0),
+            (x: 3.0, y: 1.0),
+            (x: 2.9, y: 1.8),
+            (x: 4.2, y: 3.0),
+            (x: 4.6, y: 2.7),
+            (x: 5.0, y: 2.7),
+            (x: 5.0, y: 3.6),
+            (x: 5.0, y: 5.0),
+            (x: 4.0, y: 6.0),
+            (x: 3.2, y: 6.0),
+            (x: 1.8, y: 6.0),
+            (x: 1.1, y: 6.0),
+            (x: 0.3, y: 5.0),
+            (x: 0.3, y: 3.8),
+            (x: 0.1, y: 3.6),
+            (x: -0.3, y: 3.6),
+            (x: -0.3, y: 2.7),
+            (x: 0.1, y: 2.7),
+            (x: 1.0, y: 2.5),
+            (x: 1.6, y: 2.4),
+            (x: 2.0, y: 2.0),
+            (x: 2.0, y: 1.0),
+            (x: 3.0, y: 0.0),
+        ];
+        assert_eq!(hull, correct_hull);
     }
 }
