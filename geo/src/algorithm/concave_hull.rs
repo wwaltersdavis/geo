@@ -1,8 +1,11 @@
+use crate::algorithm::Kernel;
 use crate::convex_hull::qhull;
+use crate::coordinate_position::CoordPos;
 use crate::utils::partial_min;
 use crate::{
-    Contains, Coord, Distance, Euclidean, GeoFloat, Intersects, Length, Line, LineString,
-    MultiLineString, MultiPoint, MultiPolygon, Polygon, Triangle, coord, point,
+    Contains, Coord, CoordinatePosition, Distance, Euclidean, GeoFloat, Intersects, Length, Line,
+    LineString, LinesIter, MultiLineString, MultiPoint, MultiPolygon, Orientation, Point, Polygon,
+    Triangle, coord, point,
 };
 use rstar::{AABB, Envelope, ParentNode, RTree, RTreeNode, RTreeNum};
 use std::{
@@ -15,15 +18,16 @@ use std::{
 /// constructing edges such that the exterior of the polygon incorporates points that would
 /// be interior points in a convex hull.
 ///
-/// This implementation is a port of Volodymyr Agafonkin's <https://github.com/mapbox/concaveman> which is based on ideas from
+/// This implementation is adapted from Volodymyr Agafonkin's <https://github.com/mapbox/concaveman> which is based on ideas from
 /// the paper [A New Concave Hull Algorithm and Concaveness Measure for n-dimensional Datasets, 2012](https://jise.iis.sinica.edu.tw/JISESearch/fullText?pId=245&code=5A9B97538372AA1).
+/// It uses the same concaveman approach for handling interior points, but differs by respecting interior lines and/or polygons if provided as part of the input geometries.
 ///
 /// # Arguments
 /// * `concave_hull_options` - Optional configuration for the concave hull algorithm:
 ///   - `concavity` - A relative measure of how concave the hull should be. Lower values result in a more
 ///     concave hull. Infinity would result in a convex hull. 2.0 results in a relatively detailed shape. (default: 2.0)
 ///   - `length_threshold` - The minimum length of constituent hull edges. Edges shorter than this will not be
-///     drilled down any further. Set to 0.0 for no threshold. (default: 0.0)
+///     drilled down any further. (default: 0.0)
 ///
 /// # Returns
 /// * A `Polygon` representing a concave hull of the geometry.
@@ -31,14 +35,17 @@ use std::{
 /// # Algorithm
 ///
 /// The algorithm works as follows:
-/// 1. Start with the convex hull of all input points as the initial boundary
+/// 1. Start with the convex hull of all input geometries as the initial boundary
 /// 2. For each edge of the hull boundary:
 ///    - If the edge length exceeds the `length_threshold`, attempt to "drill inward"
 ///    - Search for the closest interior point within `max_length = edge_length / concavity` from edge
 ///    - Verify the candidate is closer to this edge than adjacent hull edges
 ///    - Verify that connecting to this point won't cause intersections with existing hull edges
+///    - (If interior polygons are provided) Verify the candidate point is not inside any interior polygons
+///    - (If interior lines and/or polygons are provided) Verify that connecting to this point won't cause any "proper" intersections with interior lines and/or polygons
 ///    - Continue searching until a valid candidate is found or no more points are within the `max_length`
-///    - Verify that adding this point won't cause any previously checked interior points to be excluded from the hull and if one is excluded use that point as the candidate
+///    - Verify that adding this point won't cause any previously checked interior points to be excluded from the hull. If one is excluded, use that point as the candidate (if interior
+///      lines and/or polygons are provided perform checks as above and return no candidate if fails)
 /// 3. If a valid candidate is found:
 ///    - Create two new edges: start→candidate and candidate→end
 ///    - Verify at least one of the new edges is less than `max_length`
@@ -129,7 +136,7 @@ where
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
         let mut coords: Vec<Coord<T>> = self.iter().map(|point| point.0).collect();
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        concave_hull_with_options(&mut coords, concave_hull_options, None, None)
     }
 }
 
@@ -138,13 +145,21 @@ where
     T: GeoFloat + RTreeNum,
 {
     type Scalar = T;
-    /// Note that the concave hull may intersect with the interior of the original geometry boundaries.
     fn concave_hull_with_options(
         &self,
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
-        let mut coords: Vec<Coord<T>> = self.exterior().0.clone();
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        let capacity = self.exterior().0.len();
+        let mut coords: Vec<Coord<T>> = Vec::with_capacity(capacity);
+        let mut lines: Vec<Line<T>> = Vec::with_capacity(capacity);
+        let mut polygons: Vec<Polygon<T>> = Vec::with_capacity(1);
+        extend_with_polygon(self, &mut coords, &mut lines, &mut polygons);
+        concave_hull_with_options(
+            &mut coords,
+            concave_hull_options,
+            Some(lines),
+            Some(polygons),
+        )
     }
 }
 
@@ -153,16 +168,23 @@ where
     T: GeoFloat + RTreeNum,
 {
     type Scalar = T;
-    /// Note that the concave hull may intersect with the interior of the original geometry boundaries.
     fn concave_hull_with_options(
         &self,
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
-        let mut coords: Vec<Coord<T>> = Vec::new();
+        let capacity: usize = self.0.iter().map(|p| p.exterior().0.len()).sum();
+        let mut coords: Vec<Coord<T>> = Vec::with_capacity(capacity);
+        let mut lines: Vec<Line<T>> = Vec::with_capacity(capacity);
+        let mut polygons: Vec<Polygon<T>> = Vec::with_capacity(self.0.len());
         for polygon in self.0.iter() {
-            coords.extend(polygon.exterior().0.iter().skip(1));
+            extend_with_polygon(polygon, &mut coords, &mut lines, &mut polygons);
         }
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        concave_hull_with_options(
+            &mut coords,
+            concave_hull_options,
+            Some(lines),
+            Some(polygons),
+        )
     }
 }
 
@@ -171,13 +193,13 @@ where
     T: GeoFloat + RTreeNum,
 {
     type Scalar = T;
-    /// Note that the concave hull may intersect with the original geometry boundaries.
     fn concave_hull_with_options(
         &self,
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
         let mut coords: Vec<Coord<T>> = self.0.clone();
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        let lines: Vec<Line<T>> = self.lines().collect();
+        concave_hull_with_options(&mut coords, concave_hull_options, Some(lines), None)
     }
 }
 
@@ -186,13 +208,13 @@ where
     T: GeoFloat + RTreeNum,
 {
     type Scalar = T;
-    /// Note that the concave hull may intersect with the original geometry boundaries.
     fn concave_hull_with_options(
         &self,
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
-        let mut coords: Vec<Coord<T>> = self.iter().flat_map(|elem| elem.0.clone()).collect();
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        let mut coords: Vec<Coord<T>> = self.iter().flat_map(|ls| ls.0.clone()).collect();
+        let lines: Vec<Line<T>> = self.iter().flat_map(|ls| ls.lines()).collect();
+        concave_hull_with_options(&mut coords, concave_hull_options, Some(lines), None)
     }
 }
 
@@ -206,7 +228,7 @@ where
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
         let mut coords: Vec<Coord<T>> = self.clone();
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        concave_hull_with_options(&mut coords, concave_hull_options, None, None)
     }
 }
 
@@ -220,7 +242,7 @@ where
         concave_hull_options: ConcaveHullOptions<Self::Scalar>,
     ) -> Polygon<T> {
         let mut coords: Vec<Coord<T>> = self.to_vec();
-        concave_hull_with_options(&mut coords, concave_hull_options)
+        concave_hull_with_options(&mut coords, concave_hull_options, None, None)
     }
 }
 
@@ -308,6 +330,21 @@ struct CurrentHullEdge<T: GeoFloat + RTreeNum> {
     i: usize,
     prev_i: usize,
     next_i: usize,
+    is_interior_line: bool,
+}
+
+fn extend_with_polygon<T>(
+    polygon: &Polygon<T>,
+    coords: &mut Vec<Coord<T>>,
+    lines: &mut Vec<Line<T>>,
+    polygons: &mut Vec<Polygon<T>>,
+) where
+    T: GeoFloat + RTreeNum,
+{
+    // Add polygon's exterior to coords, lines, and polygons
+    coords.extend(polygon.exterior().0.iter().skip(1));
+    lines.extend(polygon.exterior().lines_iter());
+    polygons.push(Polygon::new(polygon.exterior().clone(), vec![]));
 }
 
 fn line_to_bbox_distance<T>(line: &Line<T>, bbox: &AABB<Coord<T>>) -> T
@@ -351,19 +388,25 @@ where
     partial_min(partial_min(d1, d2), partial_min(d3, d4))
 }
 
+fn bbox_of_line<T>(line: &Line<T>) -> AABB<Point<T>>
+where
+    T: GeoFloat + RTreeNum,
+{
+    // Create bounding box around a line
+    let min_x = T::min(line.start.x, line.end.x);
+    let max_x = T::max(line.start.x, line.end.x);
+    let min_y = T::min(line.start.y, line.end.y);
+    let max_y = T::max(line.start.y, line.end.y);
+    AABB::from_corners(point!([min_x, min_y]), point!([max_x, max_y]))
+}
+
 fn no_hull_intersections<T>(line: &Line<T>, current_hull_tree: &RTree<Line<T>>) -> bool
 where
     T: GeoFloat + RTreeNum,
 {
     // Check if the line intersects with any existing hull line
     // Hull lines which share an endpoint with the line are skipped
-
-    // Create bounding box for the line
-    let min_x = T::min(line.start.x, line.end.x);
-    let max_x = T::max(line.start.x, line.end.x);
-    let min_y = T::min(line.start.y, line.end.y);
-    let max_y = T::max(line.start.y, line.end.y);
-    let bbox = AABB::from_corners(point!([min_x, min_y]), point!([max_x, max_y]));
+    let bbox = bbox_of_line(line);
 
     // Iterate over all lines in the hull which intersect with the bounding box
     let hull_lines = current_hull_tree.locate_in_envelope_intersecting(&bbox);
@@ -383,34 +426,126 @@ where
     true
 }
 
-fn find_excluded_point<T>(
+fn point_not_inside_interior_polygons<T>(coord: &Coord<T>, tree: &Option<RTree<Polygon<T>>>) -> bool
+where
+    T: GeoFloat + RTreeNum,
+{
+    // Check if candidate point is inside any interior polygons (if any were provided)
+    if let Some(tree) = tree {
+        // Get all polygons which overlap with the point
+        let interior_polygons =
+            tree.locate_in_envelope_intersecting(&AABB::from_point(Point::from(*coord)));
+        for interior_polygon in interior_polygons {
+            if interior_polygon.contains(coord) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn proper_intersection<T>(line_a: &Line<T>, line_b: &Line<T>) -> bool
+where
+    T: GeoFloat,
+{
+    // Check to see if the two lines "properly" intersect. A "proper" intersection is as an intersection
+    // where the point of intersection is not an endpoint of either line.
+
+    // Get orientation of line a's start and end with respect to line b.
+    let check_1_1 = T::Ker::orient2d(line_b.start, line_b.end, line_a.start);
+    let check_1_2 = T::Ker::orient2d(line_b.start, line_b.end, line_a.end);
+
+    // If both orientations are the same or either orientation is collinear, this is not considered a "proper" intersection.
+    if check_1_1 == check_1_2
+        || check_1_1 == Orientation::Collinear
+        || check_1_2 == Orientation::Collinear
+    {
+        return false;
+    }
+
+    // Get orientation of line b's start and end with respect to line a.
+    let check_2_1 = T::Ker::orient2d(line_a.start, line_a.end, line_b.start);
+    let check_2_2 = T::Ker::orient2d(line_a.start, line_a.end, line_b.end);
+
+    // Return true only if the orientations are different and neither is collinear.
+    check_2_1 != check_2_2
+        && check_2_1 != Orientation::Collinear
+        && check_2_2 != Orientation::Collinear
+}
+
+fn no_interior_line_proper_intersections<T>(
+    line: &Line<T>,
+    interior_lines_tree: &Option<RTree<Line<T>>>,
+) -> bool
+where
+    T: GeoFloat + RTreeNum,
+{
+    // Check if the line has any "proper" intersections with interior lines (if any were provided)
+    if let Some(interior_lines_tree) = interior_lines_tree {
+        let bbox = bbox_of_line(line);
+        let interior_lines = interior_lines_tree.locate_in_envelope_intersecting(&bbox);
+        for interior_line in interior_lines {
+            if proper_intersection(line, interior_line) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn check_for_excluded_geometries<T>(
     start_line: Line<T>,
     end_line: Line<T>,
     previously_checked_points: &[Coord<T>],
+    interior_polygon_tree: &Option<RTree<Polygon<T>>>,
+    interior_lines_tree: &Option<RTree<Line<T>>>,
 ) -> Option<Coord<T>>
 where
     T: GeoFloat,
 {
     // Check previously checked interior points to see if any would lie outside the hull if the new lines were added.
-    // If so, return that point as the candidate to ensure all interior points remain within the hull.
-
-    // Create a triangle which represents the area which would be excluded from the hull
+    // If so, return that point as the candidate to ensure all interior points remain within the hull. If interior polygons/lines are provided,
+    // also ensure that the candidate point passes those checks otherwise return None.
     let triangle = Triangle::new(start_line.start, start_line.end, end_line.end);
     for point in previously_checked_points {
-        // If the point is contained within the triangle, it would be outside the hull and so return it as the candidate
-        if triangle.contains(point) {
+        if interior_lines_tree.is_some() {
+            match triangle.coordinate_position(point) {
+                CoordPos::Inside | CoordPos::OnBoundary => {
+                    // Ensure the candidate point passes interior polygon/line checks
+                    if point_not_inside_interior_polygons(point, interior_polygon_tree)
+                        && no_interior_line_proper_intersections(
+                            &Line::new(start_line.start, *point),
+                            interior_lines_tree,
+                        )
+                        && no_interior_line_proper_intersections(
+                            &Line::new(*point, end_line.end),
+                            interior_lines_tree,
+                        )
+                    {
+                        return Some(*point);
+                    } else {
+                        // If a point is found which would be excluded by the candidate but itself fails the interior checks, return None
+                        return None;
+                    }
+                }
+                CoordPos::Outside => {}
+            }
+        } else if triangle.contains(point) {
+            // If the point is contained within the triangle, it would be outside the hull so return it as the candidate
             return Some(*point);
         }
     }
-    None
+    Some(start_line.end)
 }
 
 fn find_candidate<T>(
     hull_edge: &CurrentHullEdge<T>,
     max_length: &T,
     current_hull_edges: &[CurrentHullEdge<T>],
-    interior_points_tree: &RTree<Coord<T>>,
     current_hull_tree: &RTree<Line<T>>,
+    interior_points_tree: &RTree<Coord<T>>,
+    interior_lines_tree: &Option<RTree<Line<T>>>,
+    interior_polygon_tree: &Option<RTree<Polygon<T>>>,
 ) -> Option<Coord<T>>
 where
     T: GeoFloat + RTreeNum,
@@ -470,17 +605,23 @@ where
                 let end_line = Line::new(*leaf, line.end);
 
                 // Check if using candidate point would cause intersections with hull lines
+                // If interior polygons are provided, check if candidate point is inside any of them
+                // If interior lines/polygons are provided, check if new hull lines would cause any "proper" intersections with them
                 if no_hull_intersections(&start_line, current_hull_tree)
                     && no_hull_intersections(&end_line, current_hull_tree)
+                    && point_not_inside_interior_polygons(leaf, interior_polygon_tree)
+                    && no_interior_line_proper_intersections(&start_line, interior_lines_tree)
+                    && no_interior_line_proper_intersections(&end_line, interior_lines_tree)
                 {
                     // Check if any of the previously checked interior points would lie outside the hull if the new lines
                     // were added and use that point as the candidate if so
-                    if let Some(point) =
-                        find_excluded_point(start_line, end_line, &previously_checked_points)
-                    {
-                        return Some(point);
-                    }
-                    return Some(*leaf);
+                    return check_for_excluded_geometries(
+                        start_line,
+                        end_line,
+                        &previously_checked_points,
+                        interior_polygon_tree,
+                        interior_lines_tree,
+                    );
                 }
                 previously_checked_points.push(*leaf);
             }
@@ -518,9 +659,35 @@ where
     }
 }
 
+fn is_interior_line<T>(line: &Line<T>, interior_lines_tree: &Option<RTree<Line<T>>>) -> bool
+where
+    T: GeoFloat + RTreeNum,
+{
+    // Check if the line is one of the provided interior lines (if any were provided)
+    if let Some(tree) = interior_lines_tree {
+        if tree.contains(line) || tree.contains(&Line::new(line.end, line.start)) {
+            true
+        } else {
+            // Check if the line is part of any interior line segments
+            let bbox = bbox_of_line(line);
+            let interior_lines = tree.locate_in_envelope_intersecting(&bbox);
+            for interior_line in interior_lines {
+                if interior_line.contains(line) {
+                    return true;
+                }
+            }
+            false
+        }
+    } else {
+        false
+    }
+}
+
 fn concave_hull_with_options<T>(
     coords: &mut [Coord<T>],
     concave_hull_options: ConcaveHullOptions<T>,
+    interior_lines: Option<Vec<Line<T>>>,
+    interior_polygons: Option<Vec<Polygon<T>>>,
 ) -> Polygon<T>
 where
     T: GeoFloat + RTreeNum,
@@ -541,6 +708,10 @@ where
     let mut interior_points_tree: RTree<Coord<T>> = RTree::bulk_load(coords.to_owned());
     let mut current_hull_tree: RTree<Line<T>> = RTree::bulk_load(convex_hull.lines().collect());
 
+    // Build R-trees for interior lines and polygons if provided
+    let interior_lines_tree: Option<RTree<Line<T>>> = interior_lines.map(RTree::bulk_load);
+    let interior_polygons_tree: Option<RTree<Polygon<T>>> = interior_polygons.map(RTree::bulk_load);
+
     let mut edge_queue: VecDeque<CurrentHullEdge<T>> = VecDeque::new();
     let mut current_hull_edges: Vec<CurrentHullEdge<T>> = Vec::new();
 
@@ -552,9 +723,14 @@ where
             i,
             prev_i: if i == 0 { hull_length - 1 } else { i - 1 },
             next_i: if i == hull_length - 1 { 0 } else { i + 1 },
+            is_interior_line: is_interior_line(&line, &interior_lines_tree),
         };
         current_hull_edges.push(edge.clone());
-        edge_queue.push_back(edge);
+
+        // Only add to edge queue if not already an interior line (if any were provided)
+        if !edge.is_interior_line {
+            edge_queue.push_back(edge);
+        }
 
         // Remove hull points from interior points
         if i == 0 {
@@ -576,8 +752,10 @@ where
                 &hull_edge,
                 &max_length,
                 &current_hull_edges,
-                &interior_points_tree,
                 &current_hull_tree,
+                &interior_points_tree,
+                &interior_lines_tree,
+                &interior_polygons_tree,
             ) {
                 // Create new hull lines from start→candidate and candidate→end
                 let start_line = Line::new(line.start, candidate_point);
@@ -604,12 +782,14 @@ where
                         i: hull_edge.i,
                         prev_i: hull_edge.prev_i,
                         next_i: end_edge_i,
+                        is_interior_line: is_interior_line(&start_line, &interior_lines_tree),
                     };
                     let end_hull_edge = CurrentHullEdge {
                         line: end_line,
                         i: end_edge_i,
                         prev_i: hull_edge.i,
                         next_i: hull_edge.next_i,
+                        is_interior_line: is_interior_line(&end_line, &interior_lines_tree),
                     };
 
                     // Replace the current edge with the new start edge
@@ -618,9 +798,13 @@ where
                     // Push new end edge to current hull edges
                     current_hull_edges.push(end_hull_edge.clone());
 
-                    // Push both new edges to queue
-                    edge_queue.push_back(start_hull_edge);
-                    edge_queue.push_back(end_hull_edge);
+                    // Push new edges to queue if they are not interior lines (if any were provided)
+                    if !start_hull_edge.is_interior_line {
+                        edge_queue.push_back(start_hull_edge.clone());
+                    }
+                    if !end_hull_edge.is_interior_line {
+                        edge_queue.push_back(end_hull_edge.clone());
+                    }
 
                     continue;
                 }
@@ -677,8 +861,9 @@ mod tests {
     #[test]
     fn test_norway_mainland() {
         let norway = geo_test_fixtures::norway_main::<f64>();
+        let norway_coords = norway.coords().copied().collect::<Vec<Coord<f64>>>();
         let correct_hull: LineString = geo_test_fixtures::norway_concave_hull::<f64>();
-        let hull = norway.concave_hull();
+        let hull = norway_coords.concave_hull();
         assert_eq!(hull.exterior(), &correct_hull);
     }
 
@@ -707,32 +892,40 @@ mod tests {
     fn test_multipolygon() {
         let mp: MultiPolygon<f64> = vec![
             polygon![
-                (x: 0.0, y: 0.0),
-                (x: 0.0, y: 2.0),
-                (x: 2.0, y: 2.0),
-                (x: 2.0, y: 0.0),
-                (x: 0.0, y: 0.0),
+                (x: -4.802, y: 1.413),
+                (x: 5.173, y: 1.413),
+                (x: 5.173, y: 1.538),
+                (x: -4.802, y: 1.413),
             ],
             polygon![
-                (x: 3.0, y: 0.0),
-                (x: 3.0, y: 5.0),
-                (x: 4.0, y: 5.0),
-                (x: 4.0, y: 0.0),
-                (x: 3.0, y: 0.0),
+                (x: -4.927, y: 1.538),
+                (x: -4.802, y: 1.413),
+                (x: 5.173, y: 1.538),
+                (x: -4.927, y: 1.538),
+            ],
+            polygon![
+                (x: -4.927, y: -8.45),
+                (x: -4.802, y: -8.45),
+                (x: -4.802, y: 1.413),
+                (x: -4.927, y: -8.45),
+            ],
+            polygon![
+                (x: -4.927, y: -8.45),
+                (x: -4.802, y: 1.413),
+                (x: -4.927, y: 1.538),
+                (x: -4.927, y: -8.45),
             ],
         ]
         .into();
-        let hull = mp.concave_hull();
+        let hull = mp.concave_hull_with_options(ConcaveHullOptions::default().concavity(1.0));
         let correct_hull = polygon![
-            (x: 4.0, y: 0.0),
-            (x: 4.0, y: 5.0),
-            (x: 3.0, y: 5.0),
-            (x: 2.0, y: 2.0),
-            (x: 0.0, y: 2.0),
-            (x: 0.0, y: 0.0),
-            (x: 2.0, y: 0.0),
-            (x: 3.0, y: 0.0),
-            (x: 4.0, y: 0.0),
+            (x: -4.802, y: -8.45),
+            (x: -4.802, y: 1.413),
+            (x: 5.173, y: 1.413),
+            (x: 5.173, y: 1.538),
+            (x: -4.927, y: 1.538),
+            (x: -4.927, y: -8.45),
+            (x: -4.802, y: -8.45),
         ];
         assert_eq!(hull, correct_hull);
     }
